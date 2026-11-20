@@ -9,7 +9,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from ai_router.config import REVIEW_ROLES, ROUTER_MODEL, get_log_file, get_review_timeout
+from ai_router.config import (
+    REVIEW_ROLES,
+    ROUTER_MODEL,
+    get_agent_timeout,
+    get_log_file,
+    get_review_timeout,
+)
 from ai_router.dispatch import (
     RC_COMMAND_NOT_FOUND,
     RC_TIMEOUT,
@@ -19,10 +25,15 @@ from ai_router.dispatch import (
     write_prompt_file,
 )
 from ai_router.errors import AiRouteError
-from ai_router.files import resolve_files
+from ai_router.files import format_files_for_agent, resolve_files
+from ai_router.flow import launch_implementer
 from ai_router.models import DispatchEntry
-from ai_router.storage import append_jsonl
+from ai_router.sessions import build_session_meta
+from ai_router.storage import append_jsonl, save_session_meta
+from ai_router.twostage import PLAN_JSON_SCHEMA, build_implementation_prompt, extract_plan, resolve_implementer
 from ai_router.utils import (
+    append_plan_first,
+    plan_first_enabled,
     get_git_root,
     get_repo_and_branch,
     now_iso,
@@ -68,6 +79,13 @@ def collect_review_target(args: argparse.Namespace, cwd: Path, repo_root: Path |
 
 def cmd_review(args: argparse.Namespace) -> None:
     """Run parallel code reviews across multiple models (headless or tiled interactive)."""
+    then_implement = getattr(args, "then_implement", None)
+    if then_implement is not None:
+        if args.mode != "headless":
+            raise AiRouteError("--then-implement requires headless reviews (--mode headless).")
+        if args.wait and args.impl_mode != "headless":
+            raise AiRouteError("--wait requires --impl-mode headless.")
+        args.synthesize = True
     cwd = Path.cwd()
     repo_root = get_git_root(cwd)
     specs = parse_model_specs(args.models, args.preset)
@@ -180,6 +198,7 @@ def cmd_review(args: argparse.Namespace) -> None:
             report_parts.append(f"## {r['tool']} ({r['model']}) [{r['latency_ms']} ms]\n\n{r['output']}\n")
 
     synthesized = False
+    syn_out = ""
     if args.synthesize:
         if not succeeded:
             print("  [warn] Skipping synthesis: no successful reviews to synthesize.", file=sys.stderr)
@@ -195,6 +214,12 @@ def cmd_review(args: argparse.Namespace) -> None:
                     f"## {r['tool']} ({r['model']})\n\n{r['output']}\n" for r in succeeded
                 )
             )
+            if then_implement is not None:
+                syn_prompt += (
+                    "\n---\n最後に、統合結果に基づく修正計画を次のスキーマのJSONオブジェクトとして出力してください。"
+                    "ファイルの編集は行わないでください。\n"
+                    f"{PLAN_JSON_SCHEMA}\n"
+                )
             print(f"  [synthesizing with {syn_tool}:{syn_model}...]")
             try:
                 syn_rc, syn_out, syn_lat = run_agent_headless_once(
@@ -241,6 +266,7 @@ def cmd_review(args: argparse.Namespace) -> None:
             "models": [f"{t}:{m}" for t, m in specs],
             "failed_models": [f"{r['tool']}:{r['model']}" for r in failed],
             "synthesized": synthesized,
+            "then_implement": then_implement,
             "timeout_sec": timeout,
             "report_path": str(out_path),
             "files": args.files or [],
@@ -253,6 +279,121 @@ def cmd_review(args: argparse.Namespace) -> None:
 
     if not succeeded:
         raise AiRouteError(f"All {len(results)} review model(s) failed; report saved to {out_path}")
+
+    if then_implement is not None:
+        if not synthesized:
+            raise AiRouteError("Synthesis failed; skipping --then-implement (report saved).")
+        _implement_from_review(
+            args,
+            cwd=cwd,
+            group_id=group_id,
+            focus=focus,
+            synthesized_output=syn_out,
+            planner=(syn_tool, syn_model),
+            report_path=out_path,
+            impl_spec=then_implement,
+        )
+
+
+def _implement_from_review(
+    args: argparse.Namespace,
+    *,
+    cwd: Path,
+    group_id: str,
+    focus: str,
+    synthesized_output: str,
+    planner: tuple[str, str],
+    report_path: Path,
+    impl_spec: str,
+) -> None:
+    """Launch an implementer using the synthesized review as the planner output."""
+    plan, valid = extract_plan(synthesized_output)
+    if not valid:
+        print("[warn] Synthesis did not contain a valid plan JSON; passing it as raw notes.", file=sys.stderr)
+    impl_tool, impl_model = resolve_implementer(plan["implementer_difficulty"], impl_spec or None, None)
+    task = (
+        f"マルチモデルコードレビュー（group: {group_id}, 重点: {focus}）で指摘された問題を修正してください。"
+        f"レビュー全文: {report_path}"
+    )
+    files_block = format_files_for_agent(resolve_files(args.files or [], get_git_root(cwd)), using_worktree=False)
+    prompt = build_implementation_prompt(plan, task, files_block)
+    prompt = append_plan_first(prompt, plan_first_enabled(False, args.impl_mode))
+
+    session_id = uuid.uuid4().hex[:8]
+    repo_name, branch_name = get_repo_and_branch(cwd)
+    print(f"\n=== Implementing review result with {impl_tool}:{impl_model} (session={session_id}) ===")
+    meta = build_session_meta(
+        session_id=session_id,
+        tool=impl_tool,
+        model=impl_model,
+        workdir=cwd,
+        handoff_count=0,
+        difficulty=plan["implementer_difficulty"],
+        refined_prompt=prompt,
+        task=task,
+        status="running",
+        event="route",
+        stage="implementer",
+        parent_session=group_id,
+        mode=args.impl_mode,
+        decision={**plan, "tool": planner[0], "model": planner[1], "valid": valid, "ts": now_iso()},
+    )
+    save_session_meta(cwd, meta)
+    common = {"repo": repo_name, "branch": branch_name, "workdir": str(cwd), "task": task}
+    append_jsonl(
+        {
+            "ts": now_iso(),
+            "event": "two_stage",
+            "source": "review",
+            "status": "planned",
+            "group_id": group_id,
+            "parent_session": group_id,
+            "session_id": session_id,
+            "planner_tool": planner[0],
+            "planner_model": planner[1],
+            "plan_valid": valid,
+            "implementer_tool": impl_tool,
+            "implementer_model": impl_model,
+            "implementer_difficulty": plan["implementer_difficulty"],
+            **common,
+        }
+    )
+    append_jsonl(
+        {
+            "ts": now_iso(),
+            "event": "route",
+            "session_id": session_id,
+            "tool": impl_tool,
+            "model": impl_model,
+            "difficulty": plan["implementer_difficulty"],
+            "mode": args.impl_mode,
+            "worktree": False,
+            "router_model": None,
+            "router_latency_ms": 0,
+            "is_fallback": False,
+            "files": args.files or [],
+            "reason": f"review --then-implement (group {group_id})",
+            "stage": "implementer",
+            "parent_session": group_id,
+            "wait": bool(args.wait),
+            **common,
+        }
+    )
+    launch_implementer(
+        tool=impl_tool,
+        model=impl_model,
+        prompt=prompt,
+        workdir=cwd,
+        mode=args.impl_mode,
+        wait=bool(args.wait),
+        session_id=session_id,
+        meta=meta,
+        timeout=get_agent_timeout(args.agent_timeout),
+        auto_escalate=bool(args.auto_escalate),
+        stage="implementer",
+        win_name=f"fix-{group_id[:6]}",
+        pane_title=f"fix:{impl_tool}:{impl_model[:14]}",
+    )
 
 
 def _describe_failure(rc: int) -> str:

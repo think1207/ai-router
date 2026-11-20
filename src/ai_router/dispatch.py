@@ -9,7 +9,12 @@ import tempfile
 import time
 from pathlib import Path
 
-from ai_router.config import AGY_PASTE_DELAY_SEC, AGY_PASTE_FALLBACK, OPENCODE_ATTACH_URL
+from ai_router.config import (
+    AGY_PASTE_DELAY_SEC,
+    AGY_PASTE_FALLBACK,
+    OPENCODE_ATTACH_URL,
+    get_session_log_dir,
+)
 from ai_router.errors import AiRouteError
 from ai_router.models import DispatchEntry
 from ai_router.utils import run_cmd
@@ -23,6 +28,34 @@ def write_prompt_file(prompt: str) -> Path:
     return Path(path_str)
 
 
+EXIT_LINE_PREFIX = "[ai-route] exit="
+# Written to a session log before each new agent run on that session
+RUN_START_LINE = "[ai-route] run-start"
+
+
+def _agent_invocation(tool: str, model: str, pf: str, mode: str, agy_paste_fallback: bool) -> str:
+    m = shlex.quote(model)
+    if tool == "claude":
+        if mode == "headless":
+            return f'claude --model {m} -p "$(cat {pf})"'
+        return f'claude --model {m} "$(cat {pf})"'
+
+    if tool == "opencode":
+        attach_flag = f"--attach {shlex.quote(OPENCODE_ATTACH_URL)} " if OPENCODE_ATTACH_URL else ""
+        if mode == "headless":
+            return f'opencode run {attach_flag}-m {m} "$(cat {pf})"'
+        return f'opencode -m {m} --prompt "$(cat {pf})"'
+
+    if tool == "agy":
+        if mode == "headless":
+            return f'agy --model {m} -p "$(cat {pf})"'
+        if agy_paste_fallback:
+            return f"agy --model {m}"
+        return f'agy --model {m} --prompt-interactive "$(cat {pf})"'
+
+    raise ValueError(f"Unsupported tool: {tool}")
+
+
 def build_agent_shell_cmd(
     tool: str,
     model: str,
@@ -30,30 +63,49 @@ def build_agent_shell_cmd(
     mode: str,
     *,
     agy_paste_fallback: bool = AGY_PASTE_FALLBACK,
+    log_path: Path | None = None,
 ) -> str:
-    """Build the shell command string executed inside a tmux pane or current shell."""
+    """Build the shell command string executed inside a tmux pane or current shell.
+
+    With ``log_path``, the agent's exit code is echoed as ``[ai-route] exit=N`` and, in
+    headless mode, all output is also tee'd into the log so `ai-route status` can inspect
+    it later. Interactive output is captured separately via ``tmux pipe-pane`` (piping a
+    TUI would break its TTY). Without ``log_path`` the command is unchanged.
+    """
     pf = shlex.quote(str(prompt_file))
-    m = shlex.quote(model)
+    invocation = _agent_invocation(tool, model, pf, mode, agy_paste_fallback)
+    tail = f'rm -f {pf}; exec "$SHELL"'
+    if log_path is None:
+        return f"{invocation}; {tail}"
 
-    if tool == "claude":
-        if mode == "headless":
-            return f'claude --model {m} -p "$(cat {pf})"; rm -f {pf}; exec "$SHELL"'
-        return f'claude --model {m} "$(cat {pf})"; rm -f {pf}; exec "$SHELL"'
+    lf = shlex.quote(str(log_path))
+    exit_echo = f'echo "{EXIT_LINE_PREFIX}$?"'
+    if mode == "headless":
+        return f"{{ {invocation}; {exit_echo}; }} 2>&1 | tee -a {lf}; {tail}"
+    return f"{invocation}; {exit_echo}; {tail}"
 
-    if tool == "opencode":
-        attach_flag = f"--attach {shlex.quote(OPENCODE_ATTACH_URL)} " if OPENCODE_ATTACH_URL else ""
-        if mode == "headless":
-            return f'opencode run {attach_flag}-m {m} "$(cat {pf})"; rm -f {pf}; exec "$SHELL"'
-        return f'opencode -m {m} --prompt "$(cat {pf})"; rm -f {pf}; exec "$SHELL"'
 
-    if tool == "agy":
-        if mode == "headless":
-            return f'agy --model {m} -p "$(cat {pf})"; rm -f {pf}; exec "$SHELL"'
-        if agy_paste_fallback:
-            return f'agy --model {m}; rm -f {pf}; exec "$SHELL"'
-        return f'agy --model {m} --prompt-interactive "$(cat {pf})"; rm -f {pf}; exec "$SHELL"'
+def session_log_path(session_id: str) -> Path:
+    """Return (and create the parent of) the output log path for a session."""
+    path = get_session_log_dir() / f"{session_id}.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
-    raise ValueError(f"Unsupported tool: {tool}")
+
+def begin_session_log(session_id: str, tool: str, model: str) -> Path:
+    """Return the session log path after appending a RUN_START_LINE header for a new run."""
+    path = session_log_path(session_id)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(f"{RUN_START_LINE} {time.strftime('%Y-%m-%dT%H:%M:%S')} {tool}:{model}\n")
+    return path
+
+
+def _pipe_pane_to_log(pane_id: str, log_path: Path) -> None:
+    """Mirror an interactive pane's output into `log_path` (best effort)."""
+    run_cmd(
+        ["tmux", "pipe-pane", "-o", "-t", pane_id, f"cat >> {shlex.quote(str(log_path))}"],
+        check=False,
+    )
 
 
 # Shell-style return codes reported when an agent could not run to completion
@@ -131,6 +183,7 @@ def dispatch_to_tmux(
     prompt_file: Path,
     split_current: bool = False,
     pane_title: str = "",
+    log_path: Path | None = None,
 ) -> None:
     """Launch an agent inside a new tmux window/pane, or exec directly if outside tmux."""
     if not os.environ.get("TMUX"):
@@ -165,6 +218,8 @@ def dispatch_to_tmux(
         ]
 
     pane_id = run_cmd(tmux_cmd).stdout.strip()
+    if log_path is not None and mode == "interactive":
+        _pipe_pane_to_log(pane_id, log_path)
     if pane_title:
         run_cmd(["tmux", "select-pane", "-t", pane_id, "-T", pane_title], check=False)
 
@@ -217,6 +272,8 @@ def dispatch_tiled_panes(*, win_name: str, entries: list[DispatchEntry]) -> None
             run_cmd(["tmux", "select-layout", "-t", win_target, "tiled"], check=False)
 
         run_cmd(["tmux", "select-pane", "-t", pane_id, "-T", entry.title], check=False)
+        if entry.log_path is not None and entry.mode == "interactive":
+            _pipe_pane_to_log(pane_id, entry.log_path)
         pane_ids.append((pane_id, entry))
 
     run_cmd(["tmux", "select-layout", "-t", win_target, "tiled"], check=False)

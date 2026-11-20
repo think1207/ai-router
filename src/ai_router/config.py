@@ -8,6 +8,7 @@ for Japanese agent interactions.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -49,6 +50,8 @@ TEST_CMD_TIMEOUT_SEC: float = 300.0  # AI_ROUTE_TEST_CMD_TIMEOUT: `compare --tes
 ROUTER_TIMEOUT_ENV = "AI_ROUTE_ROUTER_TIMEOUT"
 REVIEW_TIMEOUT_ENV = "AI_ROUTE_REVIEW_TIMEOUT"
 TEST_CMD_TIMEOUT_ENV = "AI_ROUTE_TEST_CMD_TIMEOUT"
+AGENT_TIMEOUT_SEC: float = 1800.0  # AI_ROUTE_AGENT_TIMEOUT: synchronous agent runs (--wait, planner, escalate)
+AGENT_TIMEOUT_ENV = "AI_ROUTE_AGENT_TIMEOUT"
 
 
 def resolve_timeout(cli_value: float | None, env_name: str, default: float) -> float | None:
@@ -88,6 +91,11 @@ def get_test_cmd_timeout(cli_value: float | None = None) -> float | None:
     return resolve_timeout(cli_value, TEST_CMD_TIMEOUT_ENV, TEST_CMD_TIMEOUT_SEC)
 
 
+def get_agent_timeout(cli_value: float | None = None) -> float | None:
+    """Effective timeout for synchronous agent runs (None = unlimited)."""
+    return resolve_timeout(cli_value, AGENT_TIMEOUT_ENV, AGENT_TIMEOUT_SEC)
+
+
 def get_log_file() -> Path:
     """Return the path to the JSONL history log file."""
     override = os.environ.get("AI_ROUTE_LOG_FILE")
@@ -95,6 +103,81 @@ def get_log_file() -> Path:
         return Path(override).expanduser()
     xdg_data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
     return xdg_data_home / "ai-route" / "history.jsonl"
+
+
+def get_session_log_dir() -> Path:
+    """Directory holding per-session agent output logs (tee / tmux pipe-pane)."""
+    return get_log_file().parent / "sessions"
+
+
+# ---------------------------------------------------------------------------
+# Blocked (waiting-for-decision) detection
+# ---------------------------------------------------------------------------
+
+# Explicit marker agents are asked to print when they need a human decision
+BLOCKED_MARKER: str = "[[AI_ROUTE_BLOCKED]]"
+
+# Instruction appended to synchronous headless prompts (`run --wait`, two-stage, escalate
+# implementers) so a stuck agent stops with a machine-readable marker instead of guessing.
+HEADLESS_BLOCKED_INSTRUCTION: str = (
+    "※人間の判断が必要で作業を進められない場合は、推測で進めずに作業を止め、"
+    "出力の最後に次の形式で記載して終了してください。\n"
+    f"{BLOCKED_MARKER}\n"
+    "質問: <判断が必要な点>\n"
+    "選択肢: <A / B / ...>\n"
+    "推奨: <推奨案とその理由>"
+)
+
+# Question-like phrases searched in the tail of an agent's output (case-insensitive).
+BLOCKED_PATTERNS: tuple[str, ...] = (
+    # Japanese
+    r"(して|進めて)?(も)?よろしいですか",
+    r"よろしいでしょうか",
+    r"(どちら|どれ|どの(案|方針|方法))(に|で|を)(しますか|しましょうか|進めますか|すべきでしょうか)",
+    r"いかが(しますか|しましょうか|でしょうか)",
+    r"ご(指示|判断|確認|選択)(を)?(ください|お願いします|いただけますか)",
+    r"(選んで|教えて|決めて)ください",
+    r"(進めて|続けて|実行して)(も)?(よい|いい)(です|でしょう)か",
+    r"判断をお願いします",
+    # English
+    r"\b(should|shall) i\b",
+    r"\b(do|would) you (want|like) me to\b",
+    r"\bwhich (option|approach|one|way)\b.*\?",
+    r"\bplease (confirm|choose|advise|decide|let me know)\b",
+    r"\blet me know (which|if|whether|how)\b",
+    r"\bwaiting for (your )?(input|confirmation|approval|decision)\b",
+    r"\bhow would you like (me )?to\b",
+)
+BLOCKED_PATTERNS_ENV = "AI_ROUTE_BLOCKED_PATTERNS"  # extra regexes separated by ";;"
+
+# Number of trailing non-empty output lines inspected for question patterns
+BLOCKED_TAIL_LINES: int = 15
+# Max characters of agent output kept in session metadata / handoff prompts
+OUTPUT_SUMMARY_CHARS: int = 2000
+# Max characters of `git diff` stored in session metadata
+SESSION_DIFF_MAX_CHARS: int = 20000
+# Max entries kept in session metadata `history`
+SESSION_HISTORY_MAX: int = 50
+# How many times `--auto-escalate` may escalate and re-run the implementer per command
+AUTO_ESCALATE_MAX_ROUNDS: int = 1
+
+
+def get_blocked_patterns() -> list[re.Pattern[str]]:
+    """Compile BLOCKED_PATTERNS plus extra patterns from $AI_ROUTE_BLOCKED_PATTERNS.
+
+    Extra patterns are separated by ``;;``. Invalid regexes are skipped with a warning.
+    Evaluated at call time so the environment can change between calls.
+    """
+    raw_patterns = list(BLOCKED_PATTERNS)
+    extra = os.environ.get(BLOCKED_PATTERNS_ENV, "")
+    raw_patterns.extend(p.strip() for p in extra.split(";;") if p.strip())
+    compiled: list[re.Pattern[str]] = []
+    for pat in raw_patterns:
+        try:
+            compiled.append(re.compile(pat, re.IGNORECASE))
+        except re.error as e:
+            print(f"[warn] Ignoring invalid blocked pattern {pat!r}: {e}", file=sys.stderr)
+    return compiled
 
 
 # Whitelisted (tool, model) candidates available for automatic routing
@@ -163,3 +246,53 @@ FALLBACK_DECISION: dict[str, str] = {
     "branch_slug": "ai-task",
     "reason": "Fallback due to router output parse error or disallowed model selection",
 }
+
+
+# ---------------------------------------------------------------------------
+# Two-stage (planner -> implementer) and escalation
+# ---------------------------------------------------------------------------
+
+# Default stage assignments as 'tool:model' specs. An empty implementer means
+# "select from CANDIDATES by the planner's implementer_difficulty".
+STAGE_DEFAULTS: dict[str, str] = {
+    "planner": "claude:opus",
+    "implementer": "",
+    "escalate": "claude:opus",
+}
+
+# Named presets for `run --two-stage --plan-preset NAME`
+STAGE_PRESETS: dict[str, dict[str, str]] = {
+    "claude": {"planner": "claude:opus", "implementer": "claude:sonnet"},
+    "cheap": {"planner": "claude:sonnet", "implementer": "opencode:opencode-go/deepseek-v4.1-flash"},
+    "gemini": {"planner": "agy:gemini-4-neon-high", "implementer": "agy:gemini-3.8-flash-medium"},
+}
+
+PLANNER_ENV = "AI_ROUTE_PLANNER"
+IMPLEMENTER_ENV = "AI_ROUTE_IMPLEMENTER"
+
+
+def _resolve_stage_spec(cli_value: str | None, env_name: str, preset: str | None, key: str) -> str:
+    if cli_value:
+        return cli_value.strip()
+    env_val = os.environ.get(env_name, "").strip()
+    if env_val:
+        return env_val
+    if preset:
+        if preset not in STAGE_PRESETS:
+            raise ValueError(f"Unknown plan preset: {preset}")
+        return STAGE_PRESETS[preset][key]
+    return STAGE_DEFAULTS[key]
+
+
+def resolve_planner_spec(cli_value: str | None = None, preset: str | None = None) -> str:
+    """Planner spec: CLI > $AI_ROUTE_PLANNER > preset > STAGE_DEFAULTS."""
+    return _resolve_stage_spec(cli_value, PLANNER_ENV, preset, "planner")
+
+
+def resolve_implementer_spec(cli_value: str | None = None, preset: str | None = None) -> str:
+    """Implementer spec: CLI > $AI_ROUTE_IMPLEMENTER > preset > STAGE_DEFAULTS.
+
+    May return a full 'tool:model', a bare tool name (pick the model by difficulty),
+    or "" (pick tool and model by difficulty).
+    """
+    return _resolve_stage_spec(cli_value, IMPLEMENTER_ENV, preset, "implementer")

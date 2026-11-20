@@ -46,8 +46,12 @@ def cmd_stats(args: argparse.Namespace) -> None:
     reviews = [e for e in events if e.get("event") == "review"]
     multis = [e for e in events if e.get("event") == "multi"]
     picks = [e for e in events if e.get("event") == "pick"]
+    blocks = [e for e in events if e.get("event") == "blocked"]
+    escalations = [e for e in events if e.get("event") == "escalated"]
+    two_stages = [e for e in events if e.get("event") == "two_stage"]
+    agent_results = [e for e in events if e.get("event") == "agent_result"]
 
-    if not routes and not handoffs and not reviews and not multis and not picks:
+    if not any((routes, handoffs, reviews, multis, picks, blocks, escalations, two_stages, agent_results)):
         print("No log entries match the specified filters.")
         return
 
@@ -97,6 +101,14 @@ def cmd_stats(args: argparse.Namespace) -> None:
     )
     print(f"Multi-model runs   : review {len(reviews)} / multi {len(multis)} / pick {len(picks)}")
     print(f"Avg router latency : {avg_lat:.0f} ms / fallbacks: {fallback_count}")
+    block_summary = summarize_blocking(blocks, escalations, two_stages, agent_results)
+    if any(block_summary[k] for k in ("blocked", "escalated", "two_stage", "agent_results")):
+        print(
+            f"Blocking / stages  : blocked {block_summary['blocked']} "
+            f"(sessions {block_summary['blocked_sessions']}) / "
+            f"escalated {block_summary['escalated']} (auto {block_summary['escalated_auto']}) / "
+            f"two-stage {block_summary['two_stage']}"
+        )
 
     if total_routes > 0:
         print("\n--- Initial Routing Breakdown by Model ---")
@@ -117,6 +129,19 @@ def cmd_stats(args: argparse.Namespace) -> None:
         for trans, cnt in transitions.most_common():
             print(f"  {cnt:>3}x  {trans}")
 
+    if block_summary["blocked_reasons"] or block_summary["result_statuses"]:
+        print("\n--- Blocking & Escalation ---")
+        if block_summary["result_statuses"]:
+            parts = ", ".join(f"{k} {v}" for k, v in block_summary["result_statuses"].most_common())
+            print(f"  agent results : {parts}")
+        if block_summary["blocked_reasons"]:
+            parts = ", ".join(f"{k} {v}" for k, v in block_summary["blocked_reasons"].most_common())
+            print(f"  blocked by    : {parts}")
+        for model_key, cnt in block_summary["blocked_models"].most_common(5):
+            print(f"  {cnt:>3}x blocked  {model_key}")
+        for model_key, cnt in block_summary["escalation_targets"].most_common(5):
+            print(f"  {cnt:>3}x escalated -> {model_key}")
+
     if picks:
         pick_wins: collections.Counter[str] = collections.Counter()
         for p in picks:
@@ -134,3 +159,39 @@ def cmd_stats(args: argparse.Namespace) -> None:
             ts_short = str(r.get("ts", ""))[:16].replace("T", " ")
             task_short = str(r.get("task", "")).replace("\n", " ")[:48]
             print(f"  [{ts_short}] {sid} | {r.get('tool')}:{r.get('model')} | {ho_tag} | {task_short}")
+
+
+def summarize_blocking(
+    blocks: list[dict[str, Any]],
+    escalations: list[dict[str, Any]],
+    two_stages: list[dict[str, Any]],
+    agent_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Aggregate blocked / escalated / two-stage counts from history events."""
+    blocked_reasons: collections.Counter[str] = collections.Counter()
+    blocked_models: collections.Counter[str] = collections.Counter()
+    for b in blocks:
+        blocked_reasons[str(b.get("reason", "unknown"))] += 1
+        blocked_models[f'{b.get("tool")} ({b.get("model")})'] += 1
+    escalation_targets: collections.Counter[str] = collections.Counter(
+        f'{e.get("tool")} ({e.get("model")})' for e in escalations
+    )
+    result_statuses: collections.Counter[str] = collections.Counter(
+        str(r.get("status", "unknown")) for r in agent_results
+    )
+    # A two-stage run logs a planner-failure or a "planned" record; count each run once.
+    two_stage_runs = {
+        str(t.get("parent_session") or t.get("session_id") or id(t)) for t in two_stages
+    }
+    return {
+        "blocked": len(blocks),
+        "blocked_sessions": len({str(b.get("session_id", "")) for b in blocks}),
+        "blocked_reasons": blocked_reasons,
+        "blocked_models": blocked_models,
+        "escalated": len(escalations),
+        "escalated_auto": sum(1 for e in escalations if e.get("trigger") == "auto"),
+        "escalation_targets": escalation_targets,
+        "two_stage": len(two_stage_runs),
+        "agent_results": len(agent_results),
+        "result_statuses": result_statuses,
+    }
