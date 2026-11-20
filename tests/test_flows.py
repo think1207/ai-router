@@ -360,6 +360,20 @@ class TestEscalateAndHandoff(_FlowHarness):
         self.assertEqual((meta["current_tool"], meta["handoff_count"], meta["session_id"]), ("agy", 1, sid))
         self.assertEqual(meta["task"], "Add DB")
 
+    def test_handoff_dispatches_to_absolute_workdir(self) -> None:
+        sid = self._blocked_session()
+        for argv in (
+            ["handoff", "--from-session", sid, "--tool", "agy", "--model", "g"],
+            ["handoff", "続きをお願いします"],
+        ):
+            self.dispatched.clear()
+            _, raised = self.run_cli(argv)
+            self.assertIsNone(raised)
+            workdir = self.dispatched[0]["workdir"]
+            self.assertTrue(workdir.is_absolute())
+            self.assertEqual(workdir, self.repo)
+            self.assertEqual(self.events("handoff")[-1]["workdir"], str(self.repo))
+
     def test_legacy_handoff_still_works_and_requires_note(self) -> None:
         _, raised = self.run_cli(["handoff", "続きをお願いします"])
         self.assertIsNone(raised)
