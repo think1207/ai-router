@@ -21,6 +21,7 @@ from ai_router.dispatch import (
     RC_TIMEOUT,
     build_agent_shell_cmd,
     dispatch_to_tmux,
+    resolve_workdir,
     run_agent_headless_once,
     begin_session_log,
     write_prompt_file,
@@ -226,7 +227,11 @@ def launch_implementer(
     ends waiting for a decision is escalated to STAGE_DEFAULTS["escalate"] and re-run with
     the decision, at most AUTO_ESCALATE_MAX_ROUNDS times. Raises AiRouteError when the
     final status is not `completed`.
+
+    `workdir` is resolved to an absolute, existing directory first, so an invalid one fails
+    before any session log, metadata or prompt file is written.
     """
+    workdir = resolve_workdir(workdir)
     if not wait:
         log_path = begin_session_log(session_id, tool, model)
         meta["log_path"] = str(log_path)

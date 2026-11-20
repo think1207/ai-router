@@ -28,6 +28,41 @@ def write_prompt_file(prompt: str) -> Path:
     return Path(path_str)
 
 
+def resolve_workdir(path: Path | str) -> Path:
+    """Return `path` as an absolute, symlink-free directory path, or raise `AiRouteError`.
+
+    Every launch path (tmux ``-c``, the tmux client's own cwd, ``cd`` in the pane's shell,
+    ``os.chdir`` outside tmux) goes through this so they all agree on the same directory.
+    A missing directory is rejected up front: tmux would otherwise silently fall back to
+    ``$HOME``, and ``subprocess`` would report a misleading "tmux: not found".
+    """
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.exists():
+        raise AiRouteError(f"Working directory does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise AiRouteError(f"Working directory is not a directory: {resolved}")
+    return resolved
+
+
+def _with_cd(shell_cmd: str, workdir: Path) -> str:
+    """Prefix `shell_cmd` with ``cd <workdir> &&`` so it only runs in that directory.
+
+    The command is brace-grouped because it is a ``;``-separated sequence: without the group
+    only its first statement would be guarded and the rest (including the final
+    ``exec "$SHELL"``) would still run in the wrong directory if ``cd`` failed.
+    """
+    return f"cd {shlex.quote(str(workdir))} && {{ {shell_cmd}; }}"
+
+
+def _absolute(path: Path | str) -> Path:
+    """Make `path` absolute (without resolving symlinks) for embedding in a shell command.
+
+    Such commands run in another process/cwd (the pane after ``cd``, or tmux's pipe-pane
+    job), so a relative path would point somewhere else than where it was computed.
+    """
+    return Path(os.path.abspath(os.path.expanduser(path)))
+
+
 EXIT_LINE_PREFIX = "[ai-route] exit="
 # Written to a session log before each new agent run on that session
 RUN_START_LINE = "[ai-route] run-start"
@@ -78,7 +113,7 @@ def build_agent_shell_cmd(
     if log_path is None:
         return f"{invocation}; {tail}"
 
-    lf = shlex.quote(str(log_path))
+    lf = shlex.quote(str(_absolute(log_path)))
     exit_echo = f'echo "{EXIT_LINE_PREFIX}$?"'
     if mode == "headless":
         return f"{{ {invocation}; {exit_echo}; }} 2>&1 | tee -a {lf}; {tail}"
@@ -103,7 +138,7 @@ def begin_session_log(session_id: str, tool: str, model: str) -> Path:
 def _pipe_pane_to_log(pane_id: str, log_path: Path) -> None:
     """Mirror an interactive pane's output into `log_path` (best effort)."""
     run_cmd(
-        ["tmux", "pipe-pane", "-o", "-t", pane_id, f"cat >> {shlex.quote(str(log_path))}"],
+        ["tmux", "pipe-pane", "-o", "-t", pane_id, f"cat >> {shlex.quote(str(_absolute(log_path)))}"],
         check=False,
     )
 
@@ -185,12 +220,20 @@ def dispatch_to_tmux(
     pane_title: str = "",
     log_path: Path | None = None,
 ) -> None:
-    """Launch an agent inside a new tmux window/pane, or exec directly if outside tmux."""
+    """Launch an agent inside a new tmux window/pane, or exec directly if outside tmux.
+
+    The agent always starts in `workdir` (resolved to an absolute path, which must exist):
+    tmux gets it via ``-c``, the tmux client runs with it as its cwd, and the pane's shell
+    command begins with ``cd <workdir> &&`` as a fallback.
+    """
+    workdir = resolve_workdir(workdir)
+
     if not os.environ.get("TMUX"):
         print("[info] Running outside tmux; launching agent in the current shell.")
         os.chdir(workdir)
         os.execvp("bash", ["bash", "-lc", shell_cmd])
 
+    launch_cmd = _with_cd(shell_cmd, workdir)
     if split_current:
         tmux_cmd = [
             "tmux",
@@ -201,7 +244,7 @@ def dispatch_to_tmux(
             "#{pane_id}",
             "-c",
             str(workdir),
-            shell_cmd,
+            launch_cmd,
         ]
     else:
         tmux_cmd = [
@@ -214,10 +257,10 @@ def dispatch_to_tmux(
             win_name,
             "-c",
             str(workdir),
-            shell_cmd,
+            launch_cmd,
         ]
 
-    pane_id = run_cmd(tmux_cmd).stdout.strip()
+    pane_id = run_cmd(tmux_cmd, cwd=workdir).stdout.strip()
     if log_path is not None and mode == "interactive":
         _pipe_pane_to_log(pane_id, log_path)
     if pane_title:
@@ -232,14 +275,22 @@ def dispatch_to_tmux(
 
 
 def dispatch_tiled_panes(*, win_name: str, entries: list[DispatchEntry]) -> None:
-    """Open a new tmux window with multiple tiled panes running agents in parallel."""
+    """Open a new tmux window with multiple tiled panes running agents in parallel.
+
+    Every pane gets the same cwd guarantees as `dispatch_to_tmux`. All entries' workdirs are
+    validated before the first window is created, so a bad entry never leaves a half-built
+    window behind.
+    """
     if not os.environ.get("TMUX"):
         raise AiRouteError("Parallel interactive mode requires running inside a tmux session.")
+
+    workdirs = [resolve_workdir(entry.workdir) for entry in entries]
 
     pane_ids: list[tuple[str, DispatchEntry]] = []
     win_target = ""
 
-    for idx, entry in enumerate(entries):
+    for idx, (entry, workdir) in enumerate(zip(entries, workdirs)):
+        launch_cmd = _with_cd(entry.shell_cmd, workdir)
         if idx == 0:
             cmd = [
                 "tmux",
@@ -250,10 +301,10 @@ def dispatch_tiled_panes(*, win_name: str, entries: list[DispatchEntry]) -> None
                 "-n",
                 win_name,
                 "-c",
-                str(entry.workdir),
-                entry.shell_cmd,
+                str(workdir),
+                launch_cmd,
             ]
-            out = run_cmd(cmd).stdout.strip().split()
+            out = run_cmd(cmd, cwd=workdir).stdout.strip().split()
             win_target, pane_id = out[0], out[1]
         else:
             cmd = [
@@ -265,10 +316,10 @@ def dispatch_tiled_panes(*, win_name: str, entries: list[DispatchEntry]) -> None
                 "-F",
                 "#{pane_id}",
                 "-c",
-                str(entry.workdir),
-                entry.shell_cmd,
+                str(workdir),
+                launch_cmd,
             ]
-            pane_id = run_cmd(cmd).stdout.strip()
+            pane_id = run_cmd(cmd, cwd=workdir).stdout.strip()
             run_cmd(["tmux", "select-layout", "-t", win_target, "tiled"], check=False)
 
         run_cmd(["tmux", "select-pane", "-t", pane_id, "-T", entry.title], check=False)

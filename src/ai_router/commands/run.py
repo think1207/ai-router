@@ -10,6 +10,7 @@ from typing import Any
 
 from ai_router.commands.session import refresh_session_from_log
 from ai_router.config import ROUTER_MODEL, get_agent_timeout, get_router_timeout, resolve_implementer_spec
+from ai_router.dispatch import resolve_workdir
 from ai_router.errors import AiRouteError
 from ai_router.files import (
     format_files_for_agent,
@@ -337,6 +338,8 @@ def cmd_handoff(args: argparse.Namespace) -> None:
     else:
         cwd = Path.cwd()
         meta = load_session_meta(cwd) or {}
+    # Normalize once so the recorded `workdir` matches the directory the new pane starts in
+    cwd = resolve_workdir(cwd)
     repo_root = get_git_root(cwd)
     resolved_files = resolve_files(args.files or [], repo_root)
     agent_files_block = format_files_for_agent(resolved_files, using_worktree=False)
