@@ -13,7 +13,7 @@ from pathlib import Path
 SUPPORTED_TOOLS: tuple[str, ...] = ("opencode", "agy", "claude")
 
 # Runtime settings configurable via environment variables
-ROUTER_MODEL: str = os.environ.get("AI_ROUTE_ROUTER_MODEL", "opencode/deepseek-v4.1-flash")
+ROUTER_MODEL: str = os.environ.get("AI_ROUTE_ROUTER_MODEL", "opencode-go/deepseek-v4.1-flash")
 OPENCODE_ATTACH_URL: str = os.environ.get("OPENCODE_ATTACH_URL", "")
 
 # Legacy tmux paste-buffer fallback for agy interactive mode (opt-in)
@@ -45,7 +45,7 @@ def get_log_file() -> Path:
 CANDIDATES: list[dict[str, str]] = [
     {
         "tool": "opencode",
-        "model": "opencode/deepseek-v4.1-flash",
+        "model": "opencode-go/deepseek-v4.1-flash",
         "difficulty": "low",
         "description": "軽微な修正、ボイラープレート生成、単一ファイルのテスト追加、ドキュメント修正",
     },
@@ -78,7 +78,7 @@ CANDIDATES: list[dict[str, str]] = [
 # Model combination presets for `review` and `multi` subcommands
 MODEL_PRESETS: dict[str, list[tuple[str, str]]] = {
     "fast": [
-        ("opencode", "opencode/deepseek-v4.1-flash"),
+        ("opencode", "opencode-go/deepseek-v4.1-flash"),
         ("agy", "gemini-3.8-flash-medium"),
     ],
     "balanced": [

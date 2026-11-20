@@ -124,7 +124,7 @@ Configured in [`src/ai_router/config.py`](src/ai_router/config.py):
 
 | Difficulty | Tool | Model | Intended Use |
 | :--- | :--- | :--- | :--- |
-| `low` | `opencode` | `opencode/deepseek-v4.1-flash` | Minor fixes, boilerplate, single-file tests, doc updates |
+| `low` | `opencode` | `opencode-go/deepseek-v4.1-flash` | Minor fixes, boilerplate, single-file tests, doc updates |
 | `medium` | `agy` | `gemini-3.8-flash-medium` | Mid-sized implementation, multi-file exploration/refactoring |
 | `medium` | `claude` | `sonnet` | Complex logic, precise edits, debugging |
 | `high` | `agy` | `gemini-4-neon-high` | High-complexity design, large cross-module refactoring |
@@ -132,7 +132,7 @@ Configured in [`src/ai_router/config.py`](src/ai_router/config.py):
 
 ### Presets (`--preset`)
 
-- `fast`: `opencode:opencode/deepseek-v4.1-flash`, `agy:gemini-3.8-flash-medium`
+- `fast`: `opencode:opencode-go/deepseek-v4.1-flash`, `agy:gemini-3.8-flash-medium`
 - `balanced` *(default)*: `agy:gemini-3.8-flash-medium`, `claude:sonnet`
 - `strong`: `claude:opus`, `agy:gemini-4-neon-high`, `claude:sonnet`
 - `all`: All configured candidates
@@ -143,7 +143,7 @@ Configured in [`src/ai_router/config.py`](src/ai_router/config.py):
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `AI_ROUTE_ROUTER_MODEL` | `opencode/deepseek-v4.1-flash` | Lightweight OpenCode model used for routing and default review synthesis |
+| `AI_ROUTE_ROUTER_MODEL` | `opencode-go/deepseek-v4.1-flash` | Lightweight OpenCode model used for routing and default review synthesis |
 | `OPENCODE_ATTACH_URL` | *(empty)* | Optional `--attach` server URL passed to `opencode run` |
 | `AI_ROUTE_LOG_FILE` | `$XDG_DATA_HOME/ai-route/history.jsonl` (fallback `~/.local/share/ai-route/history.jsonl`) | Path to the JSONL event history file |
 | `AI_ROUTE_AGY_PASTE_FALLBACK` | `false` | Set to `1` / `true` to use legacy tmux paste-buffer injection instead of `agy --prompt-interactive` |
