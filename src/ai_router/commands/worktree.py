@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
+from ai_router.errors import AiRouteError
 from ai_router.utils import get_git_root, run_cmd
 
 
@@ -13,8 +13,7 @@ def cmd_list(_: argparse.Namespace) -> None:
     """List active git worktrees for the current repository."""
     repo_root = get_git_root()
     if not repo_root:
-        print("[error] Please run this command inside a git repository.", file=sys.stderr)
-        sys.exit(1)
+        raise AiRouteError("Please run this command inside a git repository.")
     res = run_cmd(["git", "worktree", "list"], cwd=repo_root)
     print(res.stdout, end="")
 
@@ -23,8 +22,7 @@ def cmd_clean(args: argparse.Namespace) -> None:
     """Remove a completed git worktree and optionally delete its `ai/` branch."""
     repo_root = get_git_root()
     if not repo_root:
-        print("[error] Please run this command inside a git repository.", file=sys.stderr)
-        sys.exit(1)
+        raise AiRouteError("Please run this command inside a git repository.")
 
     target = Path(args.path).expanduser().resolve()
     branch_name = ""

@@ -9,13 +9,16 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from ai_router.config import REVIEW_ROLES, ROUTER_MODEL, get_log_file
+from ai_router.config import REVIEW_ROLES, ROUTER_MODEL, get_log_file, get_review_timeout
 from ai_router.dispatch import (
+    RC_COMMAND_NOT_FOUND,
+    RC_TIMEOUT,
     build_agent_shell_cmd,
     dispatch_tiled_panes,
     run_agent_headless_once,
     write_prompt_file,
 )
+from ai_router.errors import AiRouteError
 from ai_router.files import resolve_files
 from ai_router.models import DispatchEntry
 from ai_router.storage import append_jsonl
@@ -58,11 +61,7 @@ def collect_review_target(args: argparse.Namespace, cwd: Path, repo_root: Path |
                 sections.append(f"### {label}\n```diff\n{diff_out}\n```")
 
     if not sections:
-        print(
-            "[error] No diff or files found to review (specify -f, --staged, or --base).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise AiRouteError("No diff or files found to review (specify -f, --staged, or --base).")
 
     return "\n\n".join(sections)
 
@@ -123,21 +122,32 @@ def cmd_review(args: argparse.Namespace) -> None:
         dispatch_tiled_panes(win_name=f"rev-{group_id[:6]}", entries=entries)
         return
 
-    print(f"=== Multi-Model Review (group={group_id}, models={len(specs)}) ===")
+    # Validate the synthesizer spec before spending time on the reviews themselves
+    syn_tool, syn_model = "opencode", ROUTER_MODEL
+    if args.synthesize and args.synthesizer:
+        syn_tool, syn_model = parse_tool_model_spec(args.synthesizer)
+
+    timeout = get_review_timeout(args.timeout)
+    timeout_desc = f"{timeout:g}s" if timeout else "none"
+    print(f"=== Multi-Model Review (group={group_id}, models={len(specs)}, timeout={timeout_desc}) ===")
     results: list[dict[str, Any]] = []
 
+    # Each model is isolated: a crash, timeout, or missing CLI in one model is recorded
+    # as a failed result and never discards the reviews of the other models.
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(specs)) as ex:
         fut_map = {
-            ex.submit(run_agent_headless_once, tool, model, build_review_prompt(idx), cwd): (
-                idx,
-                tool,
-                model,
-            )
+            ex.submit(
+                run_agent_headless_once, tool, model, build_review_prompt(idx), cwd, timeout=timeout
+            ): (idx, tool, model)
             for idx, (tool, model) in enumerate(specs)
         }
         for fut in concurrent.futures.as_completed(fut_map):
             idx, tool, model = fut_map[fut]
-            rc, out, lat = fut.result()
+            try:
+                rc, out, lat = fut.result()
+            except Exception as e:  # noqa: BLE001 - keep other models' results no matter what
+                rc, out, lat = 1, f"[error] {type(e).__name__}: {e}", 0
+            failure = _describe_failure(rc)
             results.append(
                 {
                     "idx": idx,
@@ -146,36 +156,69 @@ def cmd_review(args: argparse.Namespace) -> None:
                     "rc": rc,
                     "output": out,
                     "latency_ms": lat,
+                    "failure": failure,
                 }
             )
-            print(f"  [done] {tool}:{model} ({lat} ms, rc={rc})")
+            label = f"[FAILED: {failure}]" if failure else "[done]"
+            print(f"  {label} {tool}:{model} ({lat} ms, rc={rc})")
 
     results.sort(key=lambda r: r["idx"])
+    succeeded = [r for r in results if not r["failure"]]
+    failed = [r for r in results if r["failure"]]
 
     report_parts = [f"# Multi-Model Code Review (group: {group_id})\n"]
+    if failed:
+        names = ", ".join(f"{r['tool']}:{r['model']} ({r['failure']})" for r in failed)
+        report_parts.append(f"> [warn] {len(failed)}/{len(results)} model(s) failed: {names}\n")
     for r in results:
-        report_parts.append(f"## {r['tool']} ({r['model']}) [{r['latency_ms']} ms]\n\n{r['output']}\n")
-
-    if args.synthesize:
-        if args.synthesizer:
-            syn_tool, syn_model = parse_tool_model_spec(args.synthesizer)
+        if r["failure"]:
+            report_parts.append(
+                f"## {r['tool']} ({r['model']}) [{r['latency_ms']} ms] - FAILED ({r['failure']})\n\n"
+                f"{r['output']}\n"
+            )
         else:
-            syn_tool, syn_model = "opencode", ROUTER_MODEL
+            report_parts.append(f"## {r['tool']} ({r['model']}) [{r['latency_ms']} ms]\n\n{r['output']}\n")
 
-        syn_prompt = (
-            "以下は同一コードに対して複数のAIモデルが独立して行ったコードレビュー結果です。\n"
-            "これらを統合し、次の3セクションで簡潔な最終レビューサマリを日本語で作成してください：\n"
-            "1. **複数モデルが一致して指摘した重要課題（優先対応）**\n"
-            "2. **特定モデルのみが指摘した注目点（見落とし防止）**\n"
-            "3. **モデル間で見解が割れた論点・設計トレードオフ**\n\n"
-            + "\n---\n".join(report_parts[1:])
-        )
-        print(f"  [synthesizing with {syn_tool}:{syn_model}...]")
-        _, syn_out, syn_lat = run_agent_headless_once(syn_tool, syn_model, syn_prompt, cwd)
-        report_parts.insert(
-            1,
-            f"## Synthesized Summary ({syn_tool}:{syn_model}, {syn_lat} ms)\n\n{syn_out}\n\n---\n",
-        )
+    synthesized = False
+    if args.synthesize:
+        if not succeeded:
+            print("  [warn] Skipping synthesis: no successful reviews to synthesize.", file=sys.stderr)
+            report_parts.insert(1, "## Synthesized Summary - SKIPPED (no successful reviews)\n\n---\n")
+        else:
+            syn_prompt = (
+                "以下は同一コードに対して複数のAIモデルが独立して行ったコードレビュー結果です。\n"
+                "これらを統合し、次の3セクションで簡潔な最終レビューサマリを日本語で作成してください：\n"
+                "1. **複数モデルが一致して指摘した重要課題（優先対応）**\n"
+                "2. **特定モデルのみが指摘した注目点（見落とし防止）**\n"
+                "3. **モデル間で見解が割れた論点・設計トレードオフ**\n\n"
+                + "\n---\n".join(
+                    f"## {r['tool']} ({r['model']})\n\n{r['output']}\n" for r in succeeded
+                )
+            )
+            print(f"  [synthesizing with {syn_tool}:{syn_model}...]")
+            try:
+                syn_rc, syn_out, syn_lat = run_agent_headless_once(
+                    syn_tool, syn_model, syn_prompt, cwd, timeout=timeout
+                )
+            except Exception as e:  # noqa: BLE001 - individual reviews must still be saved
+                syn_rc, syn_out, syn_lat = 1, f"[error] {type(e).__name__}: {e}", 0
+            syn_failure = _describe_failure(syn_rc)
+            if syn_failure:
+                print(
+                    f"  [warn] Synthesis failed ({syn_failure}); saving individual reviews only.",
+                    file=sys.stderr,
+                )
+                report_parts.insert(
+                    1,
+                    f"## Synthesized Summary ({syn_tool}:{syn_model}) - FAILED ({syn_failure})\n\n"
+                    f"> [warn] Synthesis failed; see individual reviews below.\n\n{syn_out}\n\n---\n",
+                )
+            else:
+                synthesized = True
+                report_parts.insert(
+                    1,
+                    f"## Synthesized Summary ({syn_tool}:{syn_model}, {syn_lat} ms)\n\n{syn_out}\n\n---\n",
+                )
 
     full_report = "\n".join(report_parts)
 
@@ -196,7 +239,9 @@ def cmd_review(args: argparse.Namespace) -> None:
             "branch": branch_name,
             "mode": "headless",
             "models": [f"{t}:{m}" for t, m in specs],
-            "synthesized": bool(args.synthesize),
+            "failed_models": [f"{r['tool']}:{r['model']}" for r in failed],
+            "synthesized": synthesized,
+            "timeout_sec": timeout,
             "report_path": str(out_path),
             "files": args.files or [],
             "focus": focus,
@@ -205,3 +250,17 @@ def cmd_review(args: argparse.Namespace) -> None:
 
     print("\n" + full_report)
     print(f"\n[saved] {out_path}")
+
+    if not succeeded:
+        raise AiRouteError(f"All {len(results)} review model(s) failed; report saved to {out_path}")
+
+
+def _describe_failure(rc: int) -> str:
+    """Return a short failure label for a headless agent return code ("" on success)."""
+    if rc == 0:
+        return ""
+    if rc == RC_TIMEOUT:
+        return "TIMEOUT"
+    if rc == RC_COMMAND_NOT_FOUND:
+        return "command not found"
+    return f"rc={rc}"

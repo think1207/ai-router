@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from ai_router import cli, config, dispatch, files, router, storage, utils
+from ai_router.errors import AiRouteError
 from ai_router.commands import multi, run, stats
 
 
@@ -46,9 +47,9 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(specs, [("claude", "opus"), ("agy", "gemini-4-neon-high")])
 
     def test_parse_model_specs_invalid_tool_exits(self) -> None:
-        with redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit):
-                utils.parse_model_specs("unknown:model", "balanced")
+        with self.assertRaises(AiRouteError) as ctx:
+            utils.parse_model_specs("unknown:model", "balanced")
+        self.assertIn("Unsupported tool 'unknown'", str(ctx.exception))
 
 
 class TestFiles(unittest.TestCase):
@@ -177,9 +178,8 @@ class TestCLIAndStats(unittest.TestCase):
     def test_run_rejects_partial_tool_or_model(self) -> None:
         parser = cli.build_parser()
         args = parser.parse_args(["run", "--tool", "agy", "Fix bug"])
-        with redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit):
-                run.cmd_run(args)
+        with self.assertRaises(AiRouteError):
+            run.cmd_run(args)
 
     def test_storage_and_stats_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -228,12 +228,13 @@ class TestCLIAndStats(unittest.TestCase):
     def test_compare_missing_log_exits(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing_log = Path(tmp) / "missing.jsonl"
-            parser = cli.build_parser()
-            args = parser.parse_args(["compare"])
+            err = io.StringIO()
             with mock.patch.dict(os.environ, {"AI_ROUTE_LOG_FILE": str(missing_log)}):
-                with redirect_stderr(io.StringIO()):
-                    with self.assertRaises(SystemExit):
-                        multi.cmd_compare(args)
+                with redirect_stderr(err):
+                    with self.assertRaises(SystemExit) as ctx:
+                        cli.main(["compare"])
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("[error] Log file not found", err.getvalue())
 
 
 class TestPickIntegration(unittest.TestCase):
@@ -394,8 +395,6 @@ class TestPickIntegration(unittest.TestCase):
             repo, wt1, wt2, log_path, br1, br2 = self._init_repo_with_multi_worktrees(
                 Path(tmp), dirty_winner=True
             )
-            parser = cli.build_parser()
-            args = parser.parse_args(["pick", "abc123", "1"])
 
             orig_cwd = Path.cwd()
             err = io.StringIO()
@@ -404,7 +403,7 @@ class TestPickIntegration(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"AI_ROUTE_LOG_FILE": str(log_path)}):
                     with redirect_stdout(io.StringIO()), redirect_stderr(err):
                         with self.assertRaises(SystemExit) as ctx:
-                            multi.cmd_pick(args)
+                            cli.main(["pick", "abc123", "1"])
             finally:
                 os.chdir(orig_cwd)
 
@@ -420,8 +419,6 @@ class TestPickIntegration(unittest.TestCase):
             repo, wt1, wt2, log_path, br1, br2 = self._init_repo_with_multi_worktrees(
                 Path(tmp), conflict_on_main=True
             )
-            parser = cli.build_parser()
-            args = parser.parse_args(["pick", "abc123", "1"])
 
             orig_cwd = Path.cwd()
             err = io.StringIO()
@@ -430,11 +427,11 @@ class TestPickIntegration(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"AI_ROUTE_LOG_FILE": str(log_path)}):
                     with redirect_stdout(io.StringIO()), redirect_stderr(err):
                         with self.assertRaises(SystemExit) as ctx:
-                            multi.cmd_pick(args)
+                            cli.main(["pick", "abc123", "1"])
             finally:
                 os.chdir(orig_cwd)
 
-            self.assertNotEqual(ctx.exception.code, 0)
+            self.assertEqual(ctx.exception.code, 1)
             self.assertIn("No worktrees or branches were deleted", err.getvalue())
             self.assertTrue(wt1.exists())
             self.assertTrue(wt2.exists())

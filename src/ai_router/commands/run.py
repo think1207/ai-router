@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import argparse
-import sys
 import uuid
 from pathlib import Path
 
-from ai_router.config import ROUTER_MODEL
+from ai_router.config import ROUTER_MODEL, get_router_timeout
 from ai_router.dispatch import build_agent_shell_cmd, dispatch_to_tmux, write_prompt_file
+from ai_router.errors import AiRouteError
 from ai_router.files import (
     format_files_for_agent,
     format_files_for_router,
@@ -21,8 +21,10 @@ from ai_router.storage import append_jsonl, load_session_meta, save_session_meta
 from ai_router.utils import (
     get_git_context,
     get_git_root,
+    append_plan_first,
     get_repo_and_branch,
     now_iso,
+    plan_first_enabled,
     run_cmd,
     sanitize_slug,
 )
@@ -32,14 +34,14 @@ from ai_router.worktree import create_worktree
 def cmd_run(args: argparse.Namespace) -> None:
     """Classify a task and dispatch it to the selected coding agent."""
     if bool(args.tool) != bool(args.model):
-        print("[error] Both --tool and --model must be provided together to skip routing.", file=sys.stderr)
-        sys.exit(1)
+        raise AiRouteError("Both --tool and --model must be provided together to skip routing.")
 
     repo_root = get_git_root()
     repo_ctx = get_git_context(repo_root) if repo_root else "(not a git repository)"
     task_text = load_task_text(args.task, args.task_file)
     resolved_files = resolve_files(args.files or [], repo_root)
     files_ctx = format_files_for_router(resolved_files)
+    use_plan_first = plan_first_enabled(args.no_plan_first, args.mode)
 
     if args.tool and args.model:
         decision = RouteDecision(
@@ -48,14 +50,15 @@ def cmd_run(args: argparse.Namespace) -> None:
             model=args.model,
             branch_slug=sanitize_slug(args.slug or "manual-task"),
             reason="Explicitly specified by user",
-            refined_prompt=task_text,
+            refined_prompt=append_plan_first(task_text, use_plan_first),
         )
     else:
         decision = route_task(
             task_text,
             repo_ctx,
             files_ctx,
-            plan_first=not args.no_plan_first,
+            plan_first=use_plan_first,
+            timeout=get_router_timeout(args.router_timeout),
         )
 
     agent_files_block = format_files_for_agent(resolved_files, using_worktree=bool(args.worktree))
@@ -77,8 +80,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     workdir = Path.cwd()
     if args.worktree:
         if not repo_root:
-            print("[error] --worktree can only be used inside a git repository.", file=sys.stderr)
-            sys.exit(1)
+            raise AiRouteError("--worktree can only be used inside a git repository.")
         workdir, branch = create_worktree(repo_root, decision.branch_slug, base_ref=args.base)
         print(f" Worktree   : {workdir} (branch: {branch})")
 

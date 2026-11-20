@@ -148,6 +148,9 @@ Configured in [`src/ai_router/config.py`](src/ai_router/config.py):
 | `AI_ROUTE_LOG_FILE` | `$XDG_DATA_HOME/ai-route/history.jsonl` (fallback `~/.local/share/ai-route/history.jsonl`) | Path to the JSONL event history file |
 | `AI_ROUTE_AGY_PASTE_FALLBACK` | `false` | Set to `1` / `true` to use legacy tmux paste-buffer injection instead of `agy --prompt-interactive` |
 | `AI_ROUTE_AGY_DELAY` | `2.0` | Delay in seconds before pasting into `agy` when `AI_ROUTE_AGY_PASTE_FALLBACK` is enabled |
+| `AI_ROUTE_ROUTER_TIMEOUT` | `60` | Router call timeout in seconds; falls back to the default model on timeout (`<=0` disables). Overridden by `run --router-timeout` |
+| `AI_ROUTE_REVIEW_TIMEOUT` | `300` | Per-model timeout for headless `review` and synthesis (`<=0` disables). Overridden by `review --timeout` |
+| `AI_ROUTE_TEST_CMD_TIMEOUT` | `300` | Per-worktree timeout for `compare --test-cmd` (`<=0` disables). Overridden by `compare --timeout` |
 
 ## Project Structure
 
