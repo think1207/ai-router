@@ -17,6 +17,9 @@ venv/
 .coverage
 htmlcov/
 
+# Local docs (not tracked)
+docs/
+
 # OS & editor files
 .DS_Store
 .idea/

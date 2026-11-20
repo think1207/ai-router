@@ -104,9 +104,9 @@ class TestDispatch(unittest.TestCase):
         self.assertIn("agy --model gemini-4-neon-high -p", cmd_agy_h)
 
         cmd_oc = dispatch.build_agent_shell_cmd(
-            "opencode", "opencode/deepseek-v4.1-flash", pf, "interactive"
+            "opencode", "opencode-go/deepseek-v4.1-flash", pf, "interactive"
         )
-        self.assertIn("opencode -m opencode/deepseek-v4.1-flash --prompt", cmd_oc)
+        self.assertIn("opencode -m opencode-go/deepseek-v4.1-flash --prompt", cmd_oc)
 
 
 class TestRouter(unittest.TestCase):
