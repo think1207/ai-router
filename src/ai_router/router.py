@@ -2,28 +2,25 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import time
 
 from ai_router.config import CANDIDATES, FALLBACK_DECISION, OPENCODE_ATTACH_URL, ROUTER_MODEL
 from ai_router.models import RouteDecision
-from ai_router.utils import extract_first_json_object, run_cmd, sanitize_slug
+from ai_router.utils import append_plan_first, extract_first_json_object, run_cmd, sanitize_slug
 
 
-def build_router_prompt(task: str, repo_ctx: str, files_ctx: str, plan_first: bool) -> str:
-    """Build the Japanese classification prompt for the lightweight router model."""
+def build_router_prompt(task: str, repo_ctx: str, files_ctx: str) -> str:
+    """Build the Japanese classification prompt for the lightweight router model.
+
+    The plan-first instruction is intentionally not requested from the model; it is
+    appended deterministically by `route_task` instead.
+    """
     candidates_text = "\n".join(
         f'{i + 1}. tool: "{c["tool"]}", model: "{c["model"]}" (目安: {c["difficulty"]})\n'
         f'   - 用途: {c["description"]}'
         for i, c in enumerate(CANDIDATES)
-    )
-
-    plan_note = (
-        "refined_promptの末尾には、"
-        "「まず考えられる解決方針と実装順序の選択肢を提示し、ユーザーの合意を得てからファイル編集に着手してください。」"
-        "という指示を必ず含めてください。"
-        if plan_first
-        else ""
     )
 
     return f"""あなたはソフトウェア開発タスクのルーターです。
@@ -43,7 +40,7 @@ def build_router_prompt(task: str, repo_ctx: str, files_ctx: str, plan_first: bo
   "refined_prompt": "<選定ツールに渡す整理済みの実装指示（日本語）>"
 }}
 
-{plan_note}
+refined_prompt には作業の進め方（方針の提示や合意の取り方など）に関する指示を含めないでください。必要な指示はシステム側で付与します。
 
 ## リポジトリ状況
 {repo_ctx}
@@ -56,36 +53,58 @@ def build_router_prompt(task: str, repo_ctx: str, files_ctx: str, plan_first: bo
 """
 
 
-def route_task(task: str, repo_ctx: str, files_ctx: str, plan_first: bool) -> RouteDecision:
-    """Invoke the lightweight router model and return a validated RouteDecision."""
-    prompt = build_router_prompt(task, repo_ctx, files_ctx, plan_first)
+def _fallback_decision(task: str, latency_ms: int, plan_first: bool) -> RouteDecision:
+    return RouteDecision(
+        **FALLBACK_DECISION,
+        refined_prompt=append_plan_first(task, plan_first),
+        router_latency_ms=latency_ms,
+        is_fallback=True,
+    )
+
+
+def route_task(
+    task: str,
+    repo_ctx: str,
+    files_ctx: str,
+    plan_first: bool,
+    *,
+    timeout: float | None = None,
+) -> RouteDecision:
+    """Invoke the lightweight router model and return a validated RouteDecision.
+
+    Never raises for router-side failures: a missing `opencode` binary, a timeout, a
+    non-zero exit, unparsable output, or a disallowed model all yield FALLBACK_DECISION.
+
+    When `plan_first` is True, PLAN_FIRST_INSTRUCTION is appended to `refined_prompt` on
+    every path (including fallbacks), regardless of the classified difficulty.
+    """
+    prompt = build_router_prompt(task, repo_ctx, files_ctx)
     cmd = ["opencode", "run"]
     if OPENCODE_ATTACH_URL:
         cmd.extend(["--attach", OPENCODE_ATTACH_URL])
     cmd.extend(["-m", ROUTER_MODEL, prompt])
 
     t0 = time.monotonic()
-    res = run_cmd(cmd, check=False)
+    try:
+        res = run_cmd(cmd, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        print(f"[warn] Router timed out after {timeout:g}s. Falling back.", file=sys.stderr)
+        return _fallback_decision(task, latency_ms, plan_first)
+    except OSError as e:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        print(f"[warn] Router command could not be executed ({e}). Falling back.", file=sys.stderr)
+        return _fallback_decision(task, latency_ms, plan_first)
     latency_ms = int((time.monotonic() - t0) * 1000)
 
     if res.returncode != 0:
         print(f"[warn] Router execution failed: {res.stderr.strip()}", file=sys.stderr)
-        return RouteDecision(
-            **FALLBACK_DECISION,
-            refined_prompt=task,
-            router_latency_ms=latency_ms,
-            is_fallback=True,
-        )
+        return _fallback_decision(task, latency_ms, plan_first)
 
     parsed = extract_first_json_object(res.stdout)
     if not parsed:
         print("[warn] Failed to parse JSON from router output. Falling back.", file=sys.stderr)
-        return RouteDecision(
-            **FALLBACK_DECISION,
-            refined_prompt=task,
-            router_latency_ms=latency_ms,
-            is_fallback=True,
-        )
+        return _fallback_decision(task, latency_ms, plan_first)
 
     allowed_pairs = {(c["tool"], c["model"]) for c in CANDIDATES}
     tool = str(parsed.get("tool", ""))
@@ -102,12 +121,7 @@ def route_task(task: str, repo_ctx: str, files_ctx: str, plan_first: bool) -> Ro
     if difficulty not in {"low", "medium", "high"}:
         difficulty = "medium"
 
-    refined = str(parsed.get("refined_prompt") or "").strip() or task
-    if plan_first and difficulty in {"medium", "high"} and "合意" not in refined:
-        refined += (
-            "\n\n※まずは考えられる解決アプローチと実装順序の案を提示し、"
-            "合意を得てから編集に着手してください。"
-        )
+    refined = append_plan_first(str(parsed.get("refined_prompt") or "").strip() or task, plan_first)
 
     return RouteDecision(
         difficulty=difficulty,

@@ -10,7 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ai_router.config import MODEL_PRESETS, SUPPORTED_TOOLS
+from ai_router.config import MODEL_PRESETS, PLAN_FIRST_INSTRUCTION, SUPPORTED_TOOLS
+from ai_router.errors import AiRouteError
 
 
 def now_iso() -> str:
@@ -24,14 +25,22 @@ def run_cmd(
     cwd: Path | None = None,
     check: bool = True,
     capture: bool = True,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Execute a subprocess command and return the CompletedProcess result."""
+    """Execute a subprocess command and return the CompletedProcess result.
+
+    ``timeout`` is in seconds (``None`` waits indefinitely). Note that, like
+    ``subprocess.run``, this raises ``OSError`` (e.g. ``FileNotFoundError``) when the
+    executable is missing and ``subprocess.TimeoutExpired`` on timeout, even when
+    ``check=False``.
+    """
     return subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
         check=check,
         text=True,
         capture_output=capture,
+        timeout=timeout,
     )
 
 
@@ -52,6 +61,30 @@ def get_git_dir(cwd: Path) -> Path | None:
     return raw if raw.is_absolute() else (cwd / raw).resolve()
 
 
+def resolve_commit(ref: str, cwd: Path | None = None) -> str | None:
+    """Resolve a ref (branch, tag, `HEAD`, short SHA, ...) to a full commit SHA, or None."""
+    if not ref:
+        return None
+    res = run_cmd(
+        ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=cwd, check=False
+    )
+    sha = res.stdout.strip()
+    return sha if res.returncode == 0 and sha else None
+
+
+def get_main_worktree_head(cwd: Path) -> str | None:
+    """Return the HEAD commit SHA of the repository's main worktree (first in `git worktree list`)."""
+    res = run_cmd(["git", "worktree", "list", "--porcelain"], cwd=cwd, check=False)
+    if res.returncode != 0:
+        return None
+    for line in res.stdout.splitlines():
+        if not line.strip():
+            break  # end of the first (main) worktree block
+        if line.startswith("HEAD "):
+            return line.split(" ", 1)[1].strip() or None
+    return None
+
+
 def get_repo_and_branch(cwd: Path) -> tuple[str, str]:
     """Return `(repo_name, branch_name)` for the given directory."""
     root = get_git_root(cwd)
@@ -66,6 +99,18 @@ def get_git_context(repo_root: Path) -> str:
     status = run_cmd(["git", "status", "--short"], cwd=repo_root, check=False).stdout.strip()
     status_lines = "\n".join(status.splitlines()[:25])
     return f"Git branch: {branch}\nChanged files:\n{status_lines or '(clean)'}"
+
+
+def plan_first_enabled(no_plan_first: bool, mode: str) -> bool:
+    """Return True when the plan-first instruction should be appended (interactive only)."""
+    return (not no_plan_first) and mode == "interactive"
+
+
+def append_plan_first(prompt: str, plan_first: bool) -> str:
+    """Append PLAN_FIRST_INSTRUCTION to the end of a prompt when `plan_first` is True."""
+    if not plan_first:
+        return prompt
+    return f"{prompt.rstrip()}\n\n{PLAN_FIRST_INSTRUCTION}"
 
 
 def sanitize_slug(slug: str) -> str:
@@ -92,20 +137,14 @@ def extract_first_json_object(raw_text: str) -> dict[str, Any] | None:
 def parse_tool_model_spec(raw_spec: str) -> tuple[str, str]:
     """Parse a single `'tool:model'` specification string and validate the tool name."""
     if ":" not in raw_spec:
-        print(f"[error] Model spec must use 'tool:model' format: {raw_spec}", file=sys.stderr)
-        sys.exit(1)
+        raise AiRouteError(f"Model spec must use 'tool:model' format: {raw_spec}")
     tool, model = raw_spec.split(":", 1)
     tool = tool.strip()
     model = model.strip()
     if tool not in SUPPORTED_TOOLS:
-        print(
-            f"[error] Unsupported tool '{tool}' (supported: {', '.join(SUPPORTED_TOOLS)})",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        raise AiRouteError(f"Unsupported tool '{tool}' (supported: {', '.join(SUPPORTED_TOOLS)})")
     if not model:
-        print(f"[error] Model name cannot be empty in spec: {raw_spec}", file=sys.stderr)
-        sys.exit(1)
+        raise AiRouteError(f"Model name cannot be empty in spec: {raw_spec}")
     return tool, model
 
 
@@ -122,8 +161,7 @@ def parse_model_specs(models_arg: str | None, preset_arg: str) -> list[tuple[str
         specs.append(parse_tool_model_spec(item))
 
     if not specs:
-        print("[error] No valid models specified.", file=sys.stderr)
-        sys.exit(1)
+        raise AiRouteError("No valid models specified.")
     if len(specs) < 2:
         print("[warn] Only one model specified; using multiple models is recommended for comparison.", file=sys.stderr)
     return specs

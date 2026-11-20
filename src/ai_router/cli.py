@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import shlex
+import subprocess
+import sys
 from importlib.metadata import PackageNotFoundError, version
-from typing import Sequence
+from typing import NoReturn, Sequence
 
 from ai_router.commands.multi import cmd_compare, cmd_multi, cmd_pick
 from ai_router.commands.review import cmd_review
@@ -12,6 +15,7 @@ from ai_router.commands.run import cmd_handoff, cmd_run
 from ai_router.commands.stats import cmd_stats
 from ai_router.commands.worktree import cmd_clean, cmd_list
 from ai_router.config import MODEL_PRESETS, SUPPORTED_TOOLS
+from ai_router.errors import AiRouteError
 
 
 def _get_version() -> str:
@@ -100,6 +104,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Print routing decision and refined prompt without launching",
+    )
+    p_run.add_argument(
+        "--router-timeout",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help=(
+            "Timeout for the router model call; falls back to the default model on timeout "
+            "(default: $AI_ROUTE_ROUTER_TIMEOUT or 60; <=0 disables)"
+        ),
     )
     p_run.set_defaults(func=cmd_run)
 
@@ -193,6 +207,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Synthesizer model in 'tool:model' format (defaults to router model)",
     )
     p_rev.add_argument("-o", "--output", default="", help="Output path for the review report")
+    p_rev.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help=(
+            "Per-model timeout for headless reviews and synthesis "
+            "(default: $AI_ROUTE_REVIEW_TIMEOUT or 300; <=0 disables)"
+        ),
+    )
     p_rev.set_defaults(func=cmd_review)
 
     # multi
@@ -265,6 +289,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--test-cmd",
         default="",
         help="Verification command to run in each worktree (e.g. 'pytest -q')",
+    )
+    p_cmp.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help=(
+            "Per-worktree timeout for --test-cmd "
+            "(default: $AI_ROUTE_TEST_CMD_TIMEOUT or 300; <=0 disables)"
+        ),
     )
     p_cmp.set_defaults(func=cmd_compare)
 
@@ -373,8 +407,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _format_cmd(cmd: object) -> str:
+    if isinstance(cmd, (list, tuple)):
+        return shlex.join(str(c) for c in cmd)
+    return str(cmd)
+
+
+def _fail(message: str) -> NoReturn:
+    print(f"[error] {message}", file=sys.stderr)
+    sys.exit(1)
+
+
 def main(argv: Sequence[str] | None = None) -> None:
-    """Parse CLI arguments and dispatch to the selected subcommand."""
+    """Parse CLI arguments and dispatch to the selected subcommand.
+
+    All anticipated failures are reported as a single ``[error] ...`` line on stderr
+    with exit code 1 instead of a Python traceback.
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.func(args)
+    try:
+        args.func(args)
+    except AiRouteError as e:
+        _fail(str(e))
+    except subprocess.CalledProcessError as e:
+        detail = e.stderr if isinstance(e.stderr, str) else ""
+        msg = f"Command failed (rc={e.returncode}): {_format_cmd(e.cmd)}"
+        _fail(f"{msg}\n{detail.strip()}" if detail.strip() else msg)
+    except subprocess.TimeoutExpired as e:
+        _fail(f"Command timed out after {e.timeout:g}s: {_format_cmd(e.cmd)}")
+    except FileNotFoundError as e:
+        _fail(f"File or command not found: {e.filename or e}")
+    except OSError as e:
+        _fail(f"OS error: {e}")
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        _fail("Interrupted by user.")

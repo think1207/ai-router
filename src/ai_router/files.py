@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from ai_router.config import ROUTER_FILE_MAX_LINES, ROUTER_TOTAL_PREVIEW_CHARS
+from ai_router.errors import AiRouteError
 from ai_router.models import ResolvedFile
 from ai_router.utils import run_cmd
 
@@ -19,8 +20,7 @@ def resolve_files(file_args: list[str], repo_root: Path | None) -> list[Resolved
     for raw in file_args:
         path = Path(raw).expanduser().resolve()
         if not path.exists():
-            print(f"[error] Specified file not found: {raw}", file=sys.stderr)
-            sys.exit(1)
+            raise AiRouteError(f"Specified file not found: {raw}")
         if path.is_dir():
             print(
                 f"[warn] Skipping directory (specify individual files or a glob instead): {raw}",
@@ -115,14 +115,12 @@ def load_task_text(task_arg: str | None, task_file: str | None) -> str:
         else:
             tf = Path(task_file).expanduser()
             if not tf.is_file():
-                print(f"[error] Task file not found: {task_file}", file=sys.stderr)
-                sys.exit(1)
+                raise AiRouteError(f"Task file not found: {task_file}")
             parts.append(tf.read_text(encoding="utf-8").strip())
     if task_arg:
         parts.append(task_arg.strip())
 
     combined = "\n\n".join(p for p in parts if p)
     if not combined:
-        print("[error] Please provide a task description argument or --task-file.", file=sys.stderr)
-        sys.exit(1)
+        raise AiRouteError("Please provide a task description argument or --task-file.")
     return combined

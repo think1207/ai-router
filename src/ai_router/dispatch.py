@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 import shlex
-import sys
+import subprocess
 import tempfile
 import time
 from pathlib import Path
 
 from ai_router.config import AGY_PASTE_DELAY_SEC, AGY_PASTE_FALLBACK, OPENCODE_ATTACH_URL
+from ai_router.errors import AiRouteError
 from ai_router.models import DispatchEntry
 from ai_router.utils import run_cmd
 
@@ -55,8 +56,33 @@ def build_agent_shell_cmd(
     raise ValueError(f"Unsupported tool: {tool}")
 
 
-def run_agent_headless_once(tool: str, model: str, prompt: str, cwd: Path) -> tuple[int, str, int]:
-    """Run a single agent non-interactively and return `(returncode, output, latency_ms)`."""
+# Shell-style return codes reported when an agent could not run to completion
+RC_COMMAND_NOT_FOUND = 127
+RC_TIMEOUT = 124
+
+
+def _to_text(data: str | bytes | None) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return data
+
+
+def run_agent_headless_once(
+    tool: str,
+    model: str,
+    prompt: str,
+    cwd: Path,
+    *,
+    timeout: float | None = None,
+) -> tuple[int, str, int]:
+    """Run a single agent non-interactively and return `(returncode, output, latency_ms)`.
+
+    Launch failures never raise: a missing executable (or other ``OSError``) is reported
+    as ``RC_COMMAND_NOT_FOUND`` (127) and a timeout as ``RC_TIMEOUT`` (124), with the
+    reason included in ``output``.
+    """
     if tool == "claude":
         cmd = ["claude", "--model", model, "-p", prompt]
     elif tool == "agy":
@@ -70,7 +96,17 @@ def run_agent_headless_once(tool: str, model: str, prompt: str, cwd: Path) -> tu
         raise ValueError(f"Unsupported tool: {tool}")
 
     t0 = time.monotonic()
-    res = run_cmd(cmd, cwd=cwd, check=False)
+    try:
+        res = run_cmd(cmd, cwd=cwd, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        partial = _to_text(e.stdout).strip()
+        reason = f"[error] Timed out after {timeout:g}s: {tool}:{model}"
+        return RC_TIMEOUT, f"{reason}\n[partial output]\n{partial}" if partial else reason, latency_ms
+    except OSError as e:
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        return RC_COMMAND_NOT_FOUND, f"[error] Failed to launch '{cmd[0]}': {e}", latency_ms
+
     latency_ms = int((time.monotonic() - t0) * 1000)
     output = (res.stdout or "").strip()
     if res.returncode != 0 and res.stderr:
@@ -143,8 +179,7 @@ def dispatch_to_tmux(
 def dispatch_tiled_panes(*, win_name: str, entries: list[DispatchEntry]) -> None:
     """Open a new tmux window with multiple tiled panes running agents in parallel."""
     if not os.environ.get("TMUX"):
-        print("[error] Parallel interactive mode requires running inside a tmux session.", file=sys.stderr)
-        sys.exit(1)
+        raise AiRouteError("Parallel interactive mode requires running inside a tmux session.")
 
     pane_ids: list[tuple[str, DispatchEntry]] = []
     win_target = ""
