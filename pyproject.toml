@@ -1,0 +1,18 @@
+[project]
+name = "ai-router"
+version = "0.1.0"
+description = "CLI router and orchestrator for AI coding agents (opencode, agy, claude) with tmux, git worktree, handoff, multi-model review/solve, and JSONL analytics."
+readme = "README.md"
+authors = [
+    { name = "Ryoma Sato", email = "think.twice.r.s09@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+ai-route = "ai_router.cli:main"
+ai-router = "ai_router.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14.0"]
+build-backend = "uv_build"
