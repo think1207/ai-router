@@ -6,21 +6,29 @@ import subprocess
 import sys
 import time
 
-from ai_router.config import CANDIDATES, FALLBACK_DECISION, OPENCODE_ATTACH_URL, ROUTER_MODEL
+from ai_router.config import AppConfig, get_active_config
 from ai_router.models import RouteDecision
 from ai_router.utils import append_plan_first, extract_first_json_object, run_cmd, sanitize_slug
 
 
-def build_router_prompt(task: str, repo_ctx: str, files_ctx: str) -> str:
+def build_router_prompt(
+    task: str,
+    repo_ctx: str,
+    files_ctx: str,
+    candidates: list[dict[str, str]] | None = None,
+) -> str:
     """Build the Japanese classification prompt for the lightweight router model.
 
     The plan-first instruction is intentionally not requested from the model; it is
     appended deterministically by `route_task` instead.
     """
+    if candidates is None:
+        candidates = get_active_config().candidates
+
     candidates_text = "\n".join(
         f'{i + 1}. tool: "{c["tool"]}", model: "{c["model"]}" (目安: {c["difficulty"]})\n'
         f'   - 用途: {c["description"]}'
-        for i, c in enumerate(CANDIDATES)
+        for i, c in enumerate(candidates)
     )
 
     return f"""あなたはソフトウェア開発タスクのルーターです。
@@ -53,9 +61,15 @@ refined_prompt には作業の進め方（方針の提示や合意の取り方�
 """
 
 
-def _fallback_decision(task: str, latency_ms: int, plan_first: bool) -> RouteDecision:
+def _fallback_decision(
+    task: str,
+    latency_ms: int,
+    plan_first: bool,
+    fallback_decision: dict[str, str] | None = None,
+) -> RouteDecision:
+    fb = fallback_decision if fallback_decision is not None else get_active_config().fallback_decision
     return RouteDecision(
-        **FALLBACK_DECISION,
+        **fb,
         refined_prompt=append_plan_first(task, plan_first),
         router_latency_ms=latency_ms,
         is_fallback=True,
@@ -69,20 +83,22 @@ def route_task(
     plan_first: bool,
     *,
     timeout: float | None = None,
+    config: AppConfig | None = None,
 ) -> RouteDecision:
     """Invoke the lightweight router model and return a validated RouteDecision.
 
     Never raises for router-side failures: a missing `opencode` binary, a timeout, a
-    non-zero exit, unparsable output, or a disallowed model all yield FALLBACK_DECISION.
+    non-zero exit, unparsable output, or a disallowed model all yield fallback_decision.
 
     When `plan_first` is True, PLAN_FIRST_INSTRUCTION is appended to `refined_prompt` on
     every path (including fallbacks), regardless of the classified difficulty.
     """
-    prompt = build_router_prompt(task, repo_ctx, files_ctx)
+    cfg = config or get_active_config()
+    prompt = build_router_prompt(task, repo_ctx, files_ctx, candidates=cfg.candidates)
     cmd = ["opencode", "run"]
-    if OPENCODE_ATTACH_URL:
-        cmd.extend(["--attach", OPENCODE_ATTACH_URL])
-    cmd.extend(["-m", ROUTER_MODEL, prompt])
+    if cfg.opencode_attach_url:
+        cmd.extend(["--attach", cfg.opencode_attach_url])
+    cmd.extend(["-m", cfg.router_model, prompt])
 
     t0 = time.monotonic()
     try:
@@ -90,31 +106,31 @@ def route_task(
     except subprocess.TimeoutExpired:
         latency_ms = int((time.monotonic() - t0) * 1000)
         print(f"[warn] Router timed out after {timeout:g}s. Falling back.", file=sys.stderr)
-        return _fallback_decision(task, latency_ms, plan_first)
+        return _fallback_decision(task, latency_ms, plan_first, cfg.fallback_decision)
     except OSError as e:
         latency_ms = int((time.monotonic() - t0) * 1000)
         print(f"[warn] Router command could not be executed ({e}). Falling back.", file=sys.stderr)
-        return _fallback_decision(task, latency_ms, plan_first)
+        return _fallback_decision(task, latency_ms, plan_first, cfg.fallback_decision)
     latency_ms = int((time.monotonic() - t0) * 1000)
 
     if res.returncode != 0:
         print(f"[warn] Router execution failed: {res.stderr.strip()}", file=sys.stderr)
-        return _fallback_decision(task, latency_ms, plan_first)
+        return _fallback_decision(task, latency_ms, plan_first, cfg.fallback_decision)
 
     parsed = extract_first_json_object(res.stdout)
     if not parsed:
         print("[warn] Failed to parse JSON from router output. Falling back.", file=sys.stderr)
-        return _fallback_decision(task, latency_ms, plan_first)
+        return _fallback_decision(task, latency_ms, plan_first, cfg.fallback_decision)
 
-    allowed_pairs = {(c["tool"], c["model"]) for c in CANDIDATES}
+    allowed_pairs = cfg.allowed_pairs
     tool = str(parsed.get("tool", ""))
     model = str(parsed.get("model", ""))
     is_fallback = False
 
     if (tool, model) not in allowed_pairs:
         print(f"[warn] Disallowed (tool, model)=({tool}, {model}). Falling back.", file=sys.stderr)
-        tool = FALLBACK_DECISION["tool"]
-        model = FALLBACK_DECISION["model"]
+        tool = cfg.fallback_decision["tool"]
+        model = cfg.fallback_decision["model"]
         is_fallback = True
 
     difficulty = str(parsed.get("difficulty", "medium"))

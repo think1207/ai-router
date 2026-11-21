@@ -10,7 +10,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ai_router.config import MODEL_PRESETS, PLAN_FIRST_INSTRUCTION, SUPPORTED_TOOLS
+from ai_router.config import (
+    MODEL_PRESETS,
+    PLAN_FIRST_INSTRUCTION,
+    SUPPORTED_TOOLS,
+    AppConfig,
+    get_active_config,
+)
 from ai_router.errors import AiRouteError
 
 
@@ -134,31 +140,45 @@ def extract_first_json_object(raw_text: str) -> dict[str, Any] | None:
     return None
 
 
-def parse_tool_model_spec(raw_spec: str) -> tuple[str, str]:
+def parse_tool_model_spec(
+    raw_spec: str,
+    supported_tools: tuple[str, ...] | list[str] | None = None,
+) -> tuple[str, str]:
     """Parse a single `'tool:model'` specification string and validate the tool name."""
     if ":" not in raw_spec:
         raise AiRouteError(f"Model spec must use 'tool:model' format: {raw_spec}")
     tool, model = raw_spec.split(":", 1)
     tool = tool.strip()
     model = model.strip()
-    if tool not in SUPPORTED_TOOLS:
-        raise AiRouteError(f"Unsupported tool '{tool}' (supported: {', '.join(SUPPORTED_TOOLS)})")
+    tools = supported_tools if supported_tools is not None else get_active_config().supported_tools
+    if tool not in tools:
+        raise AiRouteError(f"Unsupported tool '{tool}' (supported: {', '.join(tools)})")
     if not model:
         raise AiRouteError(f"Model name cannot be empty in spec: {raw_spec}")
     return tool, model
 
 
-def parse_model_specs(models_arg: str | None, preset_arg: str) -> list[tuple[str, str]]:
+def parse_model_specs(
+    models_arg: str | None,
+    preset_arg: str,
+    presets: dict[str, list[tuple[str, str]]] | None = None,
+    supported_tools: tuple[str, ...] | list[str] | None = None,
+) -> list[tuple[str, str]]:
     """Return a list of `(tool, model)` pairs from `--models` or a named `--preset`."""
+    active_presets = presets if presets is not None else get_active_config().presets
     if not models_arg:
-        return list(MODEL_PRESETS[preset_arg])
+        if preset_arg not in active_presets:
+            raise AiRouteError(
+                f"Unknown preset '{preset_arg}' (available: {', '.join(sorted(active_presets.keys()))})"
+            )
+        return list(active_presets[preset_arg])
 
     specs: list[tuple[str, str]] = []
     for raw in models_arg.split(","):
         item = raw.strip()
         if not item:
             continue
-        specs.append(parse_tool_model_spec(item))
+        specs.append(parse_tool_model_spec(item, supported_tools=supported_tools))
 
     if not specs:
         raise AiRouteError("No valid models specified.")

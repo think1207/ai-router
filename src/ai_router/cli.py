@@ -14,8 +14,8 @@ from ai_router.commands.review import cmd_review
 from ai_router.commands.run import cmd_handoff, cmd_run
 from ai_router.commands.stats import cmd_stats
 from ai_router.commands.worktree import cmd_clean, cmd_list
-from ai_router.config import MODEL_PRESETS, SUPPORTED_TOOLS
-from ai_router.errors import AiRouteError
+from ai_router.config import AppConfig, get_active_config, load_config, set_active_config
+from ai_router.errors import AiRouteError, ConfigError
 
 
 def _get_version() -> str:
@@ -25,14 +25,25 @@ def _get_version() -> str:
         return "0.1.0-dev"
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
     """Build and configure the top-level CLI argument parser."""
+    cfg = config or get_active_config()
+    tools_choices = list(cfg.available_tools)
+    preset_choices = list(cfg.presets.keys())
+    default_tool = "claude" if "claude" in tools_choices else tools_choices[0]
+    default_preset = "balanced" if "balanced" in preset_choices else preset_choices[0]
+
     parser = argparse.ArgumentParser(
         prog="ai-route",
         description=(
             "AI coding agent router and orchestrator with tmux, git worktree, "
             "handoff, multi-model review/solve, and JSONL analytics."
         ),
+    )
+    parser.add_argument(
+        "--config",
+        metavar="PATH",
+        help="Path to custom TOML configuration file (overrides $AI_ROUTE_CONFIG)",
     )
     parser.add_argument(
         "-V",
@@ -93,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_run.add_argument(
         "--tool",
-        choices=list(SUPPORTED_TOOLS),
+        choices=tools_choices,
         help="Skip router and force a specific tool (must be combined with --model)",
     )
     p_run.add_argument(
@@ -133,9 +144,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ho.add_argument(
         "--tool",
-        choices=list(SUPPORTED_TOOLS),
-        default="claude",
-        help="Target agent tool (default: claude)",
+        choices=tools_choices,
+        default=default_tool,
+        help=f"Target agent tool (default: {default_tool})",
     )
     p_ho.add_argument(
         "--model",
@@ -176,9 +187,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_rev.add_argument(
         "--preset",
-        choices=list(MODEL_PRESETS.keys()),
-        default="balanced",
-        help="Predefined model combination preset (default: balanced)",
+        choices=preset_choices,
+        default=default_preset,
+        help=f"Predefined model combination preset (default: {default_preset})",
     )
     p_rev.add_argument(
         "--models",
@@ -240,9 +251,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_mul.add_argument(
         "--preset",
-        choices=list(MODEL_PRESETS.keys()),
-        default="balanced",
-        help="Predefined model combination preset (default: balanced)",
+        choices=preset_choices,
+        default=default_preset,
+        help=f"Predefined model combination preset (default: {default_preset})",
     )
     p_mul.add_argument(
         "--models",
@@ -424,8 +435,26 @@ def main(argv: Sequence[str] | None = None) -> None:
     All anticipated failures are reported as a single ``[error] ...`` line on stderr
     with exit code 1 instead of a Python traceback.
     """
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+
+    # Early scan for --config
+    config_path = None
+    for i, arg in enumerate(raw_argv):
+        if arg == "--config" and i + 1 < len(raw_argv):
+            config_path = raw_argv[i + 1]
+            break
+        elif arg.startswith("--config="):
+            config_path = arg.split("=", 1)[1]
+            break
+
+    try:
+        cfg = load_config(config_path)
+        set_active_config(cfg)
+    except ConfigError as e:
+        _fail(str(e))
+
+    parser = build_parser(cfg)
+    args = parser.parse_args(raw_argv)
     try:
         args.func(args)
     except AiRouteError as e:
