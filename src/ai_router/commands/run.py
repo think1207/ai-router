@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from ai_router.commands.session import refresh_session_from_log
-from ai_router.config import ROUTER_MODEL, get_agent_timeout, get_router_timeout, resolve_implementer_spec
+from ai_router.config import (
+    ROUTER_MODEL,
+    get_active_config,
+    get_agent_timeout,
+    get_router_timeout,
+    resolve_implementer_spec,
+)
 from ai_router.dispatch import resolve_workdir
 from ai_router.errors import AiRouteError
 from ai_router.files import (
@@ -61,7 +67,13 @@ def cmd_run(args: argparse.Namespace) -> None:
     files_ctx = format_files_for_router(resolved_files)
     use_plan_first = plan_first_enabled(args.no_plan_first, args.mode)
 
+    cfg = get_active_config()
     if args.tool and args.model:
+        if (args.tool, args.model) not in cfg.allowed_pairs:
+            raise AiRouteError(
+                f"Disallowed (tool, model)=({args.tool}, {args.model}). "
+                f"Allowed pairs: {', '.join(f'{t}:{m}' for t, m in sorted(cfg.allowed_pairs))}"
+            )
         decision = RouteDecision(
             difficulty="manual",
             tool=args.tool,
@@ -77,6 +89,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             files_ctx,
             plan_first=use_plan_first,
             timeout=get_router_timeout(args.router_timeout),
+            config=cfg,
         )
 
     agent_files_block = format_files_for_agent(resolved_files, using_worktree=bool(args.worktree))

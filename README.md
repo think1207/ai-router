@@ -168,7 +168,91 @@ ai-route clean ../my-repo-worktrees/fix-parser-1121-001000 --delete-branch
 ai-route stats --here --days 30
 ```
 
-## Models & Presets
+## Configuration & Custom Model Registry
+
+`ai-router` supports external user configuration via TOML to accommodate differing model access, custom endpoints, and subscription tiers across users.
+
+### Priority Order
+
+```text
+CLI Arguments (--config, --router-timeout, etc.)
+  > Environment Variables (AI_ROUTE_CONFIG, AI_ROUTE_ROUTER_TIMEOUT, etc.)
+    > User Configuration File (~/.config/ai-route/config.toml)
+      > Built-in Defaults
+```
+
+### Configuration File Path
+
+By default, `ai-route` looks for:
+1. `--config <path>` passed via CLI
+2. `$AI_ROUTE_CONFIG` environment variable
+3. `~/.config/ai-route/config.toml` (or `$XDG_CONFIG_HOME/ai-route/config.toml`)
+
+If no configuration file is present, `ai-route` runs with complete backward compatibility using the built-in defaults.
+
+### Configuration Format (`config.toml` Example)
+
+```toml
+# List of supported tool identifiers (default: ["opencode", "agy", "claude"])
+supported_tools = ["opencode", "agy", "claude"]
+
+# Add new candidate models or override existing candidates by (tool, model) pair
+[[candidates]]
+tool = "claude"
+model = "claude-3-7-sonnet"
+difficulty = "high"
+description = "高難度タスク、複雑なリファクタリング、設計方針の検討"
+
+[[candidates]]
+tool = "claude"
+model = "sonnet"
+difficulty = "medium"
+description = "上書き: 複雑なロジック実装とデバッグ"
+
+# Remove built-in or existing candidate models
+remove_candidates = [
+    "opencode:opencode-go/deepseek-v4.1-flash",
+]
+
+# Subscription / Access Restrictions:
+# Restrict available models to a specific subset. Router candidate selection,
+# CLI choices (--tool, --preset), and fallback decisions reflect this list.
+# (If omitted, all valid candidates are allowed)
+allowed_models = [
+    "claude:sonnet",
+    "claude:opus",
+    "claude:claude-3-7-sonnet",
+    "agy:gemini-3.8-flash-medium",
+    "agy:gemini-4-neon-high",
+]
+
+# Add or override model combination presets for `review` and `multi`
+[presets]
+fast = [
+    ["agy", "gemini-3.8-flash-medium"],
+]
+my_team = [
+    ["claude", "claude-3-7-sonnet"],
+    ["agy", "gemini-4-neon-high"],
+]
+
+# Override the automatic fallback decision (used on router failure/timeout)
+[fallback]
+tool = "claude"
+model = "sonnet"
+difficulty = "medium"
+branch_slug = "ai-task"
+reason = "Fallback due to router output parse error or disallowed model selection"
+
+# Runtime settings (overridable by environment variables or CLI flags)
+[runtime]
+router_model = "opencode-go/deepseek-v4.1-flash"
+router_timeout = 60.0
+review_timeout = 300.0
+test_cmd_timeout = 300.0
+```
+
+## Built-in Models & Presets
 
 Configured in [`src/ai_router/config.py`](src/ai_router/config.py):
 
