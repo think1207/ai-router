@@ -12,9 +12,16 @@ from typing import NoReturn, Sequence
 from ai_router.commands.multi import cmd_compare, cmd_multi, cmd_pick
 from ai_router.commands.review import cmd_review
 from ai_router.commands.run import cmd_handoff, cmd_run
+from ai_router.commands.session import cmd_escalate, cmd_status
 from ai_router.commands.stats import cmd_stats
 from ai_router.commands.worktree import cmd_clean, cmd_list
-from ai_router.config import AppConfig, get_active_config, load_config, set_active_config
+from ai_router.config import (
+    STAGE_PRESETS,
+    AppConfig,
+    get_active_config,
+    load_config,
+    set_active_config,
+)
 from ai_router.errors import AiRouteError, ConfigError
 
 
@@ -126,6 +133,53 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
             "(default: $AI_ROUTE_ROUTER_TIMEOUT or 60; <=0 disables)"
         ),
     )
+    p_run.add_argument(
+        "--wait",
+        action="store_true",
+        help="With --mode headless, run synchronously and detect blocked (waiting-for-decision) output",
+    )
+    p_run.add_argument(
+        "--auto-escalate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="With --wait, escalate a blocked agent to a stronger model and resume once (default: on)",
+    )
+    p_run.add_argument(
+        "--agent-timeout",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help=(
+            "Timeout for synchronous agent runs (--wait, planner, escalation) "
+            "(default: $AI_ROUTE_AGENT_TIMEOUT or 1800; <=0 disables)"
+        ),
+    )
+    p_run.add_argument(
+        "--two-stage",
+        action="store_true",
+        help="Plan with a strong model (decisions only, no edits), then implement with another; skips the router",
+    )
+    p_run.add_argument(
+        "--plan-preset",
+        choices=list(STAGE_PRESETS.keys()),
+        default=None,
+        help="Planner/implementer preset for --two-stage",
+    )
+    p_run.add_argument(
+        "--planner",
+        default=None,
+        metavar="TOOL:MODEL",
+        help="Planner for --two-stage (default: $AI_ROUTE_PLANNER, preset, or claude:opus)",
+    )
+    p_run.add_argument(
+        "--implementer",
+        default=None,
+        metavar="TOOL[:MODEL]",
+        help=(
+            "Implementer for --two-stage; a bare tool picks the model by planned difficulty "
+            "(default: $AI_ROUTE_IMPLEMENTER, preset, or by difficulty)"
+        ),
+    )
     p_run.set_defaults(func=cmd_run)
 
     # handoff
@@ -133,7 +187,23 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
         "handoff",
         help="Hand off the current worktree diff to another model in a split pane",
     )
-    p_ho.add_argument("note", help="Handoff notes or next-step instructions")
+    p_ho.add_argument(
+        "note",
+        nargs="?",
+        default=None,
+        help="Handoff notes or next-step instructions (optional with --from-session)",
+    )
+    p_ho.add_argument(
+        "--from-session",
+        nargs="?",
+        const=".",
+        default=None,
+        metavar="SESSION_ID",
+        help=(
+            "Build the handoff from saved session state (task, refined prompt, blocked question, "
+            "output summary); without an ID, uses the current worktree's session"
+        ),
+    )
     p_ho.add_argument(
         "-f",
         "--file",
@@ -228,7 +298,118 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
             "(default: $AI_ROUTE_REVIEW_TIMEOUT or 300; <=0 disables)"
         ),
     )
+    p_rev.add_argument(
+        "--then-implement",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="TOOL[:MODEL]",
+        help=(
+            "After a headless review, use the synthesized result as the plan and launch an "
+            "implementer (implies --synthesize; default implementer chosen by planned difficulty)"
+        ),
+    )
+    p_rev.add_argument(
+        "--impl-mode",
+        choices=["interactive", "headless"],
+        default="interactive",
+        help="Execution mode of the --then-implement implementer (default: interactive)",
+    )
+    p_rev.add_argument(
+        "--wait",
+        action="store_true",
+        help="With --impl-mode headless, run the implementer synchronously and detect blocking",
+    )
+    p_rev.add_argument(
+        "--auto-escalate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="With --wait, escalate a blocked agent to a stronger model and resume once (default: on)",
+    )
+    p_rev.add_argument(
+        "--agent-timeout",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help=(
+            "Timeout for synchronous agent runs (--wait, planner, escalation) "
+            "(default: $AI_ROUTE_AGENT_TIMEOUT or 1800; <=0 disables)"
+        ),
+    )
     p_rev.set_defaults(func=cmd_review)
+
+    # escalate
+    p_esc = sub.add_parser(
+        "escalate",
+        help="Ask a stronger model to decide on a blocked session (no edits), optionally resume",
+    )
+    p_esc.add_argument(
+        "--from-session",
+        default=None,
+        metavar="SESSION_ID",
+        help="Session to escalate (default: current worktree's session)",
+    )
+    p_esc.add_argument(
+        "--tool",
+        choices=tools_choices,
+        help="Decision-maker tool (alone: its high-difficulty model; default: claude:opus)",
+    )
+    p_esc.add_argument("--model", help="Decision-maker model (requires --tool)")
+    p_esc.add_argument("--note", default="", help="Extra guidance for the decision-maker")
+    p_esc.add_argument(
+        "--then-implement",
+        action="store_true",
+        help="Resume the session's implementer with the decision",
+    )
+    p_esc.add_argument(
+        "--mode",
+        choices=["interactive", "headless"],
+        default="interactive",
+        help="Execution mode of the resumed implementer (default: interactive)",
+    )
+    p_esc.add_argument(
+        "--wait",
+        action="store_true",
+        help="With --mode headless, run the resumed implementer synchronously",
+    )
+    p_esc.add_argument(
+        "--auto-escalate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="With --wait, escalate a blocked agent to a stronger model and resume once (default: on)",
+    )
+    p_esc.add_argument(
+        "--agent-timeout",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help=(
+            "Timeout for synchronous agent runs (--wait, planner, escalation) "
+            "(default: $AI_ROUTE_AGENT_TIMEOUT or 1800; <=0 disables)"
+        ),
+    )
+    p_esc.set_defaults(func=cmd_escalate)
+
+    # status
+    p_status = sub.add_parser(
+        "status",
+        help="Show session status and detect blocked agents from captured output logs",
+    )
+    p_status.add_argument(
+        "--from-session",
+        default=None,
+        metavar="SESSION_ID",
+        help="Session to inspect (default: current worktree, else recent sessions)",
+    )
+    p_status.add_argument("--group", default="", help="Inspect all members of a `multi` group")
+    p_status.add_argument(
+        "--recent",
+        type=int,
+        default=10,
+        help="Number of recent sessions shown when no session is selected (default: 10)",
+    )
+    p_status.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    p_status.set_defaults(func=cmd_status)
 
     # multi
     p_mul = sub.add_parser(

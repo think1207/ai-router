@@ -18,6 +18,28 @@ class RouteDecision:
     refined_prompt: str
     router_latency_ms: int = 0
     is_fallback: bool = False
+    stage: str = "single"  # "single" | "planner" | "implementer"
+    parent_session: str = ""
+
+
+@dataclasses.dataclass
+class BlockSignal:
+    """Evidence that an agent stopped waiting for a human decision (or failed to run).
+
+    ``kind`` is how it was detected: ``marker`` (explicit BLOCKED_MARKER), ``pattern``
+    (question-like output tail), or ``exit`` (return code). ``reason`` is one of
+    ``blocked`` | ``timeout`` | ``launch_failed``.
+    """
+
+    kind: str
+    reason: str
+    question: str = ""
+    excerpt: str = ""
+    options: list[str] = dataclasses.field(default_factory=list)
+    recommendation: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
 
 
 @dataclasses.dataclass
@@ -44,3 +66,4 @@ class DispatchEntry:
     prompt_file: Path
     title: str
     win_name: str = ""
+    log_path: Path | None = None

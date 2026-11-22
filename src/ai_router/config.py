@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
+import re
 import sys
 import tomllib
 from pathlib import Path
@@ -89,10 +90,12 @@ DEFAULT_AGY_PASTE_DELAY_SEC: float = 2.0
 DEFAULT_ROUTER_TIMEOUT_SEC: float = 60.0
 DEFAULT_REVIEW_TIMEOUT_SEC: float = 300.0
 DEFAULT_TEST_CMD_TIMEOUT_SEC: float = 300.0
+DEFAULT_AGENT_TIMEOUT_SEC: float = 1800.0
 
 ROUTER_TIMEOUT_ENV = "AI_ROUTE_ROUTER_TIMEOUT"
 REVIEW_TIMEOUT_ENV = "AI_ROUTE_REVIEW_TIMEOUT"
 TEST_CMD_TIMEOUT_ENV = "AI_ROUTE_TEST_CMD_TIMEOUT"
+AGENT_TIMEOUT_ENV = "AI_ROUTE_AGENT_TIMEOUT"
 
 PLAN_FIRST_INSTRUCTION: str = (
     "※まずは考えられる解決アプローチと実装順序の案を提示し、合意を得てから編集に着手してください。"
@@ -107,6 +110,122 @@ REVIEW_ROLES: tuple[str, ...] = (
     "アーキテクチャ設計・責務分離・保守性・パフォーマンスへの影響",
     "セキュリティ・境界値・テスト網羅性・可読性",
 )
+
+# ---------------------------------------------------------------------------
+# Two-stage (planner -> implementer) and escalation
+# ---------------------------------------------------------------------------
+
+STAGE_DEFAULTS: dict[str, str] = {
+    "planner": "claude:opus",
+    "implementer": "",
+    "escalate": "claude:opus",
+}
+
+STAGE_PRESETS: dict[str, dict[str, str]] = {
+    "claude": {"planner": "claude:opus", "implementer": "claude:sonnet"},
+    "cheap": {"planner": "claude:sonnet", "implementer": "opencode:opencode-go/deepseek-v4.1-flash"},
+    "gemini": {"planner": "agy:gemini-4-neon-high", "implementer": "agy:gemini-3.8-flash-medium"},
+}
+
+PLANNER_ENV = "AI_ROUTE_PLANNER"
+IMPLEMENTER_ENV = "AI_ROUTE_IMPLEMENTER"
+
+
+def _resolve_stage_spec(cli_value: str | None, env_name: str, preset: str | None, key: str) -> str:
+    if cli_value:
+        return cli_value.strip()
+    env_val = os.environ.get(env_name, "").strip()
+    if env_val:
+        return env_val
+    if preset:
+        if preset not in STAGE_PRESETS:
+            raise ValueError(f"Unknown plan preset: {preset}")
+        return STAGE_PRESETS[preset][key]
+    return STAGE_DEFAULTS[key]
+
+
+def resolve_planner_spec(cli_value: str | None = None, preset: str | None = None) -> str:
+    """Planner spec: CLI > $AI_ROUTE_PLANNER > preset > STAGE_DEFAULTS."""
+    return _resolve_stage_spec(cli_value, PLANNER_ENV, preset, "planner")
+
+
+def resolve_implementer_spec(cli_value: str | None = None, preset: str | None = None) -> str:
+    """Implementer spec: CLI > $AI_ROUTE_IMPLEMENTER > preset > STAGE_DEFAULTS.
+
+    May return a full 'tool:model', a bare tool name (pick the model by difficulty),
+    or "" (pick tool and model by difficulty).
+    """
+    return _resolve_stage_spec(cli_value, IMPLEMENTER_ENV, preset, "implementer")
+
+
+# ---------------------------------------------------------------------------
+# Blocked (waiting-for-decision) detection
+# ---------------------------------------------------------------------------
+
+# Explicit marker agents are asked to print when they need a human decision
+BLOCKED_MARKER: str = "[[AI_ROUTE_BLOCKED]]"
+
+# Instruction appended to synchronous headless prompts (`run --wait`, two-stage, escalate
+# implementers) so a stuck agent stops with a machine-readable marker instead of guessing.
+HEADLESS_BLOCKED_INSTRUCTION: str = (
+    "※人間の判断が必要で作業を進められない場合は、推測で進めずに作業を止め、"
+    "出力の最後に次の形式で記載して終了してください。\n"
+    f"{BLOCKED_MARKER}\n"
+    "質問: <判断が必要な点>\n"
+    "選択肢: <A / B / ...>\n"
+    "推奨: <推奨案とその理由>"
+)
+
+# Question-like phrases searched in the tail of an agent's output (case-insensitive).
+BLOCKED_PATTERNS: tuple[str, ...] = (
+    # Japanese
+    r"(して|進めて)?(も)?よろしいですか",
+    r"よろしいでしょうか",
+    r"(どちら|どれ|どの(案|方針|方法))(に|で|を)(しますか|しましょうか|進めますか|すべきでしょうか)",
+    r"いかが(しますか|しましょうか|でしょうか)",
+    r"ご(指示|判断|確認|選択)(を)?(ください|お願いします|いただけますか)",
+    r"(選んで|教えて|決めて)ください",
+    r"(進めて|続けて|実行して)(も)?(よい|いい)(です|でしょう)か",
+    r"判断をお願いします",
+    # English
+    r"\b(should|shall) i\b",
+    r"\b(do|would) you (want|like) me to\b",
+    r"\bwhich (option|approach|one|way)\b.*\?",
+    r"\bplease (confirm|choose|advise|decide|let me know)\b",
+    r"\blet me know (which|if|whether|how)\b",
+    r"\bwaiting for (your )?(input|confirmation|approval|decision)\b",
+    r"\bhow would you like (me )?to\b",
+)
+BLOCKED_PATTERNS_ENV = "AI_ROUTE_BLOCKED_PATTERNS"  # extra regexes separated by ";;"
+
+# Number of trailing non-empty output lines inspected for question patterns
+BLOCKED_TAIL_LINES: int = 15
+# Max characters of agent output kept in session metadata / handoff prompts
+OUTPUT_SUMMARY_CHARS: int = 2000
+# Max characters of `git diff` stored in session metadata
+SESSION_DIFF_MAX_CHARS: int = 20000
+# Max entries kept in session metadata `history`
+SESSION_HISTORY_MAX: int = 50
+# How many times `--auto-escalate` may escalate and re-run the implementer per command
+AUTO_ESCALATE_MAX_ROUNDS: int = 1
+
+
+def get_blocked_patterns() -> list[re.Pattern[str]]:
+    """Compile BLOCKED_PATTERNS plus extra patterns from $AI_ROUTE_BLOCKED_PATTERNS.
+
+    Extra patterns are separated by ``;;``. Invalid regexes are skipped with a warning.
+    Evaluated at call time so the environment can change between calls.
+    """
+    raw_patterns = list(BLOCKED_PATTERNS)
+    extra = os.environ.get(BLOCKED_PATTERNS_ENV, "")
+    raw_patterns.extend(p.strip() for p in extra.split(";;") if p.strip())
+    compiled: list[re.Pattern[str]] = []
+    for pat in raw_patterns:
+        try:
+            compiled.append(re.compile(pat, re.IGNORECASE))
+        except re.error as e:
+            print(f"[warn] Ignoring invalid blocked pattern {pat!r}: {e}", file=sys.stderr)
+    return compiled
 
 
 # ---------------------------------------------------------------------------
@@ -135,12 +254,12 @@ class AppConfig:
     router_timeout_sec: float = DEFAULT_ROUTER_TIMEOUT_SEC
     review_timeout_sec: float = DEFAULT_REVIEW_TIMEOUT_SEC
     test_cmd_timeout_sec: float = DEFAULT_TEST_CMD_TIMEOUT_SEC
+    agent_timeout_sec: float = DEFAULT_AGENT_TIMEOUT_SEC
 
     @property
     def available_tools(self) -> tuple[str, ...]:
         """Return the tuple of tools that have at least one allowed (tool, model) pair."""
         tools_in_pairs = {tool for tool, _ in self.allowed_pairs}
-        # Keep the order defined in supported_tools
         return tuple(t for t in self.supported_tools if t in tools_in_pairs) or self.supported_tools
 
 
@@ -213,7 +332,6 @@ def validate_config(cfg: AppConfig) -> None:
             raise ConfigError(f"Duplicate candidate model: {tool}:{model}")
         seen_pairs.add(pair)
 
-    # Allowed pairs must not be empty
     if not cfg.allowed_pairs:
         raise ConfigError("No allowed (tool, model) pairs configured or available")
 
@@ -362,7 +480,6 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
             _parse_pair_spec(item, supported_tools, "allowed_models")
             for item in raw_allowed
         }
-        # Filter candidates by declared allowed_models
         candidates_map = {
             pair: c for pair, c in candidates_map.items() if pair in allowed_pairs_set
         }
@@ -392,8 +509,6 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         if "reason" in raw_fallback:
             fallback_decision["reason"] = str(raw_fallback["reason"]).strip()
 
-    # If the default fallback is not in allowed_pairs (e.g. user restricted allowed_models to agy),
-    # and user did not specify a custom fallback, pick the first candidate as fallback
     if (fallback_decision["tool"], fallback_decision["model"]) not in allowed_pairs_set:
         if raw_fallback is None:
             first_c = candidates[0]
@@ -403,7 +518,6 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
 
     # 5. Presets
     presets: dict[str, list[tuple[str, str]]] = {}
-    # Start with default presets, filtering out pairs that are not allowed
     for pname, pairs in DEFAULT_MODEL_PRESETS.items():
         if pname == "all":
             continue
@@ -424,7 +538,6 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
             ]
             presets[pname] = parsed_preset
 
-    # 'all' preset always includes all active candidates unless explicitly defined
     if "all" not in presets:
         presets["all"] = [(c["tool"], c["model"]) for c in candidates]
 
@@ -462,6 +575,9 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
     test_cmd_timeout = float(
         raw.get("test_cmd_timeout", raw_runtime.get("test_cmd_timeout", DEFAULT_TEST_CMD_TIMEOUT_SEC))
     )
+    agent_timeout = float(
+        raw.get("agent_timeout", raw_runtime.get("agent_timeout", DEFAULT_AGENT_TIMEOUT_SEC))
+    )
 
     cfg = AppConfig(
         supported_tools=supported_tools,
@@ -476,6 +592,7 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         router_timeout_sec=router_timeout,
         review_timeout_sec=review_timeout,
         test_cmd_timeout_sec=test_cmd_timeout,
+        agent_timeout_sec=agent_timeout,
     )
 
     validate_config(cfg)
@@ -533,7 +650,7 @@ def set_active_config(cfg: AppConfig) -> None:
     """Set the active AppConfig and synchronize module-level convenience exports."""
     global _ACTIVE_CONFIG, SUPPORTED_TOOLS, CANDIDATES, MODEL_PRESETS, FALLBACK_DECISION
     global ROUTER_MODEL, OPENCODE_ATTACH_URL, AGY_PASTE_FALLBACK, AGY_PASTE_DELAY_SEC
-    global ROUTER_TIMEOUT_SEC, REVIEW_TIMEOUT_SEC, TEST_CMD_TIMEOUT_SEC
+    global ROUTER_TIMEOUT_SEC, REVIEW_TIMEOUT_SEC, TEST_CMD_TIMEOUT_SEC, AGENT_TIMEOUT_SEC
 
     _ACTIVE_CONFIG = cfg
     SUPPORTED_TOOLS = cfg.supported_tools
@@ -547,6 +664,7 @@ def set_active_config(cfg: AppConfig) -> None:
     ROUTER_TIMEOUT_SEC = cfg.router_timeout_sec
     REVIEW_TIMEOUT_SEC = cfg.review_timeout_sec
     TEST_CMD_TIMEOUT_SEC = cfg.test_cmd_timeout_sec
+    AGENT_TIMEOUT_SEC = cfg.agent_timeout_sec
 
 
 # Backward-compatible module-level variable exports
@@ -561,6 +679,7 @@ AGY_PASTE_DELAY_SEC: float = _ACTIVE_CONFIG.agy_paste_delay_sec
 ROUTER_TIMEOUT_SEC: float = _ACTIVE_CONFIG.router_timeout_sec
 REVIEW_TIMEOUT_SEC: float = _ACTIVE_CONFIG.review_timeout_sec
 TEST_CMD_TIMEOUT_SEC: float = _ACTIVE_CONFIG.test_cmd_timeout_sec
+AGENT_TIMEOUT_SEC: float = _ACTIVE_CONFIG.agent_timeout_sec
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +722,11 @@ def get_test_cmd_timeout(cli_value: float | None = None) -> float | None:
     return resolve_timeout(cli_value, TEST_CMD_TIMEOUT_ENV, _ACTIVE_CONFIG.test_cmd_timeout_sec)
 
 
+def get_agent_timeout(cli_value: float | None = None) -> float | None:
+    """Effective timeout for synchronous agent runs (None = unlimited)."""
+    return resolve_timeout(cli_value, AGENT_TIMEOUT_ENV, _ACTIVE_CONFIG.agent_timeout_sec)
+
+
 def get_log_file() -> Path:
     """Return the path to the JSONL history log file."""
     override = os.environ.get("AI_ROUTE_LOG_FILE")
@@ -610,3 +734,8 @@ def get_log_file() -> Path:
         return Path(override).expanduser()
     xdg_data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
     return xdg_data_home / "ai-route" / "history.jsonl"
+
+
+def get_session_log_dir() -> Path:
+    """Directory holding per-session agent output logs (tee / tmux pipe-pane)."""
+    return get_log_file().parent / "sessions"

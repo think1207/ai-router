@@ -16,11 +16,13 @@ from ai_router.dispatch import (
     build_agent_shell_cmd,
     dispatch_tiled_panes,
     dispatch_to_tmux,
+    begin_session_log,
     write_prompt_file,
 )
 from ai_router.errors import AiRouteError
 from ai_router.files import format_files_for_agent, load_task_text, resolve_files
 from ai_router.models import DispatchEntry
+from ai_router.sessions import build_session_meta
 from ai_router.storage import append_jsonl, load_jsonl, save_session_meta
 from ai_router.utils import (
     append_plan_first,
@@ -75,20 +77,27 @@ def cmd_multi(args: argparse.Namespace) -> None:
         wt_path, branch_name = create_worktree(repo_root, slug, base_ref=base_sha)
 
         session_id = f"{group_id}-{idx}"
+        log_path = begin_session_log(session_id, tool, model)
         save_session_meta(
             wt_path,
-            {
-                "session_id": session_id,
-                "group_id": group_id,
-                "current_tool": tool,
-                "current_model": model,
-                "handoff_count": 0,
-                "started_at": now_iso(),
-            },
+            build_session_meta(
+                session_id=session_id,
+                tool=tool,
+                model=model,
+                workdir=wt_path,
+                handoff_count=0,
+                task=task_text,
+                refined_prompt=base_prompt,
+                status="running",
+                event="route",
+                group_id=group_id,
+                mode=args.mode,
+                log_path=str(log_path),
+            ),
         )
 
         pf = write_prompt_file(base_prompt)
-        shell_cmd = build_agent_shell_cmd(tool, model, pf, args.mode)
+        shell_cmd = build_agent_shell_cmd(tool, model, pf, args.mode, log_path=log_path)
 
         entries.append(
             DispatchEntry(
@@ -100,6 +109,7 @@ def cmd_multi(args: argparse.Namespace) -> None:
                 prompt_file=pf,
                 title=f"{idx}:{tool}:{model[:14]}",
                 win_name=f"m{group_id}-{tool[:4]}{idx}",
+                log_path=log_path,
             )
         )
         created_members.append(
@@ -143,9 +153,11 @@ def cmd_multi(args: argparse.Namespace) -> None:
                 prompt_file=entry.prompt_file,
                 split_current=False,
                 pane_title=entry.title,
+                log_path=entry.log_path,
             )
 
-    print(f"\nCompare command: ai-route compare {group_id}")
+    print(f"\nStatus command : ai-route status --group {group_id}")
+    print(f"Compare command: ai-route compare {group_id}")
     print(f"Pick command   : ai-route pick {group_id}")
 
 
