@@ -9,6 +9,7 @@ from pathlib import Path
 from ai_router.config import ROUTER_FILE_MAX_LINES, ROUTER_TOTAL_PREVIEW_CHARS
 from ai_router.errors import AiRouteError
 from ai_router.models import ResolvedFile
+from ai_router.security import MAX_READ_FILE_BYTES, is_sensitive_filename
 from ai_router.utils import run_cmd
 
 
@@ -32,6 +33,13 @@ def resolve_files(file_args: list[str], repo_root: Path | None) -> list[Resolved
             continue
         seen.add(path)
 
+        if is_sensitive_filename(path):
+            print(
+                f"[warn] Passing potentially sensitive file '{raw}' to AI agents; "
+                "ensure no secrets/credentials will be leaked.",
+                file=sys.stderr,
+            )
+
         in_repo = False
         is_tracked = False
         display_path = str(path)
@@ -41,7 +49,7 @@ def resolve_files(file_args: list[str], repo_root: Path | None) -> list[Resolved
                 in_repo = True
                 display_path = rel.as_posix()
                 chk = run_cmd(
-                    ["git", "ls-files", "--error-unmatch", display_path],
+                    ["git", "ls-files", "--error-unmatch", "--", display_path],
                     cwd=repo_root,
                     check=False,
                 )
@@ -52,19 +60,26 @@ def resolve_files(file_args: list[str], repo_root: Path | None) -> list[Resolved
         line_count: int | None = None
         preview = ""
         try:
-            text = path.read_text(encoding="utf-8")
-            lines = text.splitlines()
-            line_count = len(lines)
-            if budget > 0:
-                head = "\n".join(lines[:ROUTER_FILE_MAX_LINES])
-                if len(lines) > ROUTER_FILE_MAX_LINES:
-                    head += f"\n... (全 {line_count} 行中 {ROUTER_FILE_MAX_LINES} 行まで抜粋)"
-                if len(head) > budget:
-                    head = head[:budget] + "\n... (プレビュー上限により省略)"
-                preview = head
-                budget -= len(head)
-        except UnicodeDecodeError:
-            preview = "(binary file)"
+            file_size = path.stat().st_size
+        except OSError:
+            file_size = 0
+        if file_size > MAX_READ_FILE_BYTES:
+            preview = f"(file too large: {file_size} bytes > {MAX_READ_FILE_BYTES} bytes; skipped preview)"
+        else:
+            try:
+                text = path.read_text(encoding="utf-8")
+                lines = text.splitlines()
+                line_count = len(lines)
+                if budget > 0:
+                    head = "\n".join(lines[:ROUTER_FILE_MAX_LINES])
+                    if len(lines) > ROUTER_FILE_MAX_LINES:
+                        head += f"\n... (全 {line_count} 行中 {ROUTER_FILE_MAX_LINES} 行まで抜粋)"
+                    if len(head) > budget:
+                        head = head[:budget] + "\n... (プレビュー上限により省略)"
+                    preview = head
+                    budget -= len(head)
+            except UnicodeDecodeError:
+                preview = "(binary file)"
 
         resolved.append(
             ResolvedFile(

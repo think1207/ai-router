@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Any
 
 from ai_router.errors import ConfigError
+from ai_router.security import (
+    compile_safe_regex,
+    validate_copilot_permission_flag,
+    validate_safe_identifier,
+)
 
 # ---------------------------------------------------------------------------
 # Builtin Defaults
@@ -241,7 +246,7 @@ AUTO_ESCALATE_MAX_ROUNDS: int = 1
 def get_blocked_patterns() -> list[re.Pattern[str]]:
     """Compile BLOCKED_PATTERNS plus extra patterns from $AI_ROUTE_BLOCKED_PATTERNS.
 
-    Extra patterns are separated by ``;;``. Invalid regexes are skipped with a warning.
+    Extra patterns are separated by ``;;``. Invalid or unsafe (ReDoS) regexes are skipped with a warning.
     Evaluated at call time so the environment can change between calls.
     """
     raw_patterns = list(BLOCKED_PATTERNS)
@@ -249,10 +254,9 @@ def get_blocked_patterns() -> list[re.Pattern[str]]:
     raw_patterns.extend(p.strip() for p in extra.split(";;") if p.strip())
     compiled: list[re.Pattern[str]] = []
     for pat in raw_patterns:
-        try:
-            compiled.append(re.compile(pat, re.IGNORECASE))
-        except re.error as e:
-            print(f"[warn] Ignoring invalid blocked pattern {pat!r}: {e}", file=sys.stderr)
+        regex = compile_safe_regex(pat, label="blocked")
+        if regex is not None:
+            compiled.append(regex)
     return compiled
 
 
@@ -296,10 +300,9 @@ DEFAULT_CREDIT_PATTERNS: tuple[str, ...] = (
 def _compile_patterns(raw_patterns: list[str], label: str) -> list[re.Pattern[str]]:
     compiled: list[re.Pattern[str]] = []
     for pat in raw_patterns:
-        try:
-            compiled.append(re.compile(pat, re.IGNORECASE))
-        except re.error as e:
-            print(f"[warn] Ignoring invalid {label} pattern {pat!r}: {e}", file=sys.stderr)
+        regex = compile_safe_regex(pat, label=label)
+        if regex is not None:
+            compiled.append(regex)
     return compiled
 
 
@@ -413,6 +416,15 @@ def validate_config(cfg: AppConfig) -> None:
     for t in cfg.supported_tools:
         if not t or not isinstance(t, str):
             raise ConfigError(f"Invalid tool in supported_tools: {t!r}")
+        try:
+            validate_safe_identifier(t, "tool name")
+        except ValueError as e:
+            raise ConfigError(str(e)) from e
+
+    try:
+        validate_copilot_permission_flag(cfg.copilot_permission_flag)
+    except ValueError as e:
+        raise ConfigError(str(e)) from e
 
     if not cfg.candidates:
         raise ConfigError("No candidates configured; at least one candidate model is required")
@@ -478,6 +490,10 @@ def validate_config(cfg: AppConfig) -> None:
 
     # Presets check
     for pname, pairs in cfg.presets.items():
+        try:
+            validate_safe_identifier(pname, "preset name")
+        except ValueError as e:
+            raise ConfigError(str(e)) from e
         if not pairs:
             raise ConfigError(f"Preset {pname!r} has no models")
         for tool, model in pairs:
@@ -867,7 +883,12 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             cfg.agy_acp_mode = acp_m
             cfg.defaults.acp_mode = acp_m
     if "AI_ROUTE_COPILOT_PERMISSION_FLAG" in os.environ:
-        cfg.copilot_permission_flag = os.environ["AI_ROUTE_COPILOT_PERMISSION_FLAG"].strip()
+        raw_perm = os.environ["AI_ROUTE_COPILOT_PERMISSION_FLAG"].strip()
+        try:
+            validate_copilot_permission_flag(raw_perm)
+        except ValueError as e:
+            raise ConfigError(f"Unsafe AI_ROUTE_COPILOT_PERMISSION_FLAG: {e}") from e
+        cfg.copilot_permission_flag = raw_perm
     if "AI_ROUTE_AUTO_DETECT_TOOLS" in os.environ:
         cfg.auto_detect_tools = os.environ["AI_ROUTE_AUTO_DETECT_TOOLS"].strip().lower() not in {
             "0",

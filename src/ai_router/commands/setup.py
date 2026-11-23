@@ -18,6 +18,7 @@ from ai_router.config import (
 from ai_router.credits import format_remaining_cooldown, get_exhausted_tools
 from ai_router.errors import AiRouteError
 from ai_router.router import resolve_router_service
+from ai_router.security import ensure_private_dir, ensure_private_file
 from ai_router.tools import BUILTIN_TOOL_ADAPTERS, get_installed_tools, is_tool_installed
 
 
@@ -148,8 +149,9 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(content)
         return
 
-    target.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(target.parent)
     target.write_text(content, encoding="utf-8")
+    ensure_private_file(target)
     print(f"Generated configuration: {target}")
     if installed:
         print(f"Detected agent CLIs    : {', '.join(installed)}")

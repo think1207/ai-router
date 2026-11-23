@@ -14,6 +14,7 @@ from typing import Any
 from ai_router.config import OUTPUT_SUMMARY_CHARS, SESSION_DIFF_MAX_CHARS, SESSION_HISTORY_MAX
 from ai_router.errors import AiRouteError
 from ai_router.models import BlockSignal
+from ai_router.security import redact_secrets
 from ai_router.storage import load_jsonl, load_session_meta, save_session_meta
 from ai_router.utils import now_iso, run_cmd
 
@@ -29,8 +30,9 @@ def truncate_text(text: str, max_chars: int, *, keep: str = "head") -> str:
 
 
 def summarize_output(output: str, max_chars: int = OUTPUT_SUMMARY_CHARS) -> str:
-    """Keep the tail of an agent's output (where conclusions and questions live)."""
-    return truncate_text((output or "").strip(), max_chars, keep="tail")
+    """Keep the tail of an agent's output (with secrets redacted)."""
+    redacted = redact_secrets((output or "").strip())
+    return truncate_text(redacted, max_chars, keep="tail")
 
 
 def capture_worktree_diff(cwd: Path, max_chars: int = SESSION_DIFF_MAX_CHARS) -> dict[str, Any]:
@@ -54,10 +56,11 @@ def capture_worktree_diff(cwd: Path, max_chars: int = SESSION_DIFF_MAX_CHARS) ->
 
     untracked = "\n".join(ln for ln in status.splitlines() if ln.startswith("??"))
     diff_stat = "\n".join(x for x in (stat, untracked) if x)
-    truncated = max_chars > 0 and len(diff) > max_chars
+    redacted_diff = redact_secrets(diff)
+    truncated = max_chars > 0 and len(redacted_diff) > max_chars
     return {
         "diff_stat": diff_stat,
-        "diff": truncate_text(diff, max_chars),
+        "diff": truncate_text(redacted_diff, max_chars),
         "truncated": truncated,
     }
 

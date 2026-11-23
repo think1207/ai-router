@@ -22,6 +22,7 @@ from ai_router.dispatch import (
 from ai_router.errors import AiRouteError
 from ai_router.files import format_files_for_agent, load_task_text, resolve_files
 from ai_router.models import DispatchEntry
+from ai_router.security import validate_git_ref
 from ai_router.sessions import build_session_meta
 from ai_router.storage import append_jsonl, load_jsonl, save_session_meta
 from ai_router.utils import (
@@ -55,7 +56,8 @@ def cmd_multi(args: argparse.Namespace) -> None:
     # Pin the base to an absolute commit before creating anything. A relative ref such as
     # `HEAD` would later be re-evaluated inside each worktree (where it means the agent's own
     # HEAD), which made `compare` report zero commits.
-    base_sha = resolve_commit(args.base, repo_root)
+    safe_base = validate_git_ref(args.base, "base ref")
+    base_sha = resolve_commit(safe_base, repo_root)
     if not base_sha:
         raise AiRouteError(f"Invalid base ref '{args.base}': it does not resolve to a commit.")
 
@@ -409,7 +411,7 @@ def cmd_pick(args: argparse.Namespace) -> None:
         raise AiRouteError(f"Invalid member index: {chosen_index} (available: {avail})")
 
     winner = member_by_index[chosen_index]
-    winner_branch = str(winner.get("branch", ""))
+    winner_branch = validate_git_ref(str(winner.get("branch", "")), "winning branch")
     winner_wt = Path(winner["workdir"]).resolve()
 
     if not _branch_exists(repo_root, winner_branch):
@@ -535,8 +537,9 @@ def cmd_pick(args: argparse.Namespace) -> None:
         if wt_removed_ok and branch_name.startswith("ai/") and _branch_exists(repo_root, branch_name):
             # Non-winning branches are unmerged by design and require -D;
             # squash merges also leave the winning branch unmerged in git ancestry.
+            safe_branch = validate_git_ref(branch_name, "branch name")
             del_flag = "-d" if (is_winner and not args.squash and not args.force) else "-D"
-            br_res = run_cmd(["git", "branch", del_flag, branch_name], cwd=repo_root, check=False)
+            br_res = run_cmd(["git", "branch", del_flag, safe_branch], cwd=repo_root, check=False)
             if br_res.returncode == 0:
                 deleted_branches.append(branch_name)
                 print(f"  [deleted branch]   {branch_name}")

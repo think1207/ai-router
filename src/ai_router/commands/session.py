@@ -27,6 +27,7 @@ from ai_router.flow import (
     record_credit_exhausted,
 )
 from ai_router.models import BlockSignal
+from ai_router.security import sanitize_terminal_text
 from ai_router.sessions import append_history, build_session_meta, resolve_session, summarize_output
 from ai_router.storage import append_jsonl, load_jsonl, load_session_meta, save_session_meta
 from ai_router.twostage import build_resume_prompt, format_plan_sections, resolve_spec, select_candidate
@@ -229,15 +230,19 @@ def cmd_status(args: argparse.Namespace) -> None:
         sid = r["session_id"]
         credit_info = r.get("credit_exhausted")
         if r["status"] == "credit_exhausted" and isinstance(credit_info, dict):
-            print(f"  [credit_exhausted] {credit_info.get('reason') or 'credit/quota limit reached'}")
+            c_reason = sanitize_terminal_text(str(credit_info.get("reason") or "credit/quota limit reached"))
+            print(f"  [credit_exhausted] {c_reason}")
             print(f"    next: ai-route resume {sid}")
         blocked = r["blocked"]
         if blocked:
-            print(f"  [{blocked['reason']}/{blocked['kind']}] {blocked.get('question') or '(no question text)'}")
+            b_q = sanitize_terminal_text(str(blocked.get("question") or "(no question text)"))
+            print(f"  [{blocked['reason']}/{blocked['kind']}] {b_q}")
             if blocked.get("options"):
-                print(f"    options       : {' / '.join(blocked['options'])}")
+                opts = " / ".join(sanitize_terminal_text(str(o)) for o in blocked["options"])
+                print(f"    options       : {opts}")
             if blocked.get("recommendation"):
-                print(f"    recommendation: {blocked['recommendation']}")
+                rec_text = sanitize_terminal_text(str(blocked["recommendation"]))
+                print(f"    recommendation: {rec_text}")
             if blocked["reason"] == "blocked":
                 print(f"    next: ai-route resume {sid}")
                 print(f"          ai-route escalate --from-session {sid} --then-implement")
@@ -248,7 +253,7 @@ def _print_exhausted_summary(exhausted: dict[str, dict[str, Any]]) -> None:
     parts = []
     for tool, info in sorted(exhausted.items()):
         rem = format_remaining_cooldown(str(info.get("until") or ""))
-        reason = str(info.get("reason") or "exhausted")
+        reason = sanitize_terminal_text(str(info.get("reason") or "exhausted"))
         parts.append(f"{tool} ({rem} left: {reason})")
     print("[credits] Exhausted services: " + "; ".join(parts))
     print("          (Clear with: ai-route status --reset-credits)")

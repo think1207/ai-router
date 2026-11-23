@@ -31,6 +31,7 @@ from ai_router.files import (
 )
 from ai_router.models import RouteDecision
 from ai_router.router import route_task
+from ai_router.security import sanitize_terminal_text
 from ai_router.flow import append_headless_instruction, launch_implementer, run_and_record
 from ai_router.sessions import build_session_meta, resolve_session
 from ai_router.storage import append_jsonl, load_session_meta, save_session_meta
@@ -113,7 +114,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     if decision.effort:
         print(f" Effort     : {decision.effort}")
     print(f" Selected   : {decision.tool} ({decision.model})")
-    print(f" Reason     : {decision.reason}")
+    print(f" Reason     : {sanitize_terminal_text(decision.reason)}")
     if resolved_files:
         print(f" Files      : {', '.join(rf.display_path for rf in resolved_files)}")
     print("========================================")
@@ -272,7 +273,7 @@ def _cmd_run_two_stage(args: argparse.Namespace) -> None:
                 alt_tool, alt_model, _ = alt
                 print(
                     f"[failover] Planner {planner_tool}:{planner_model} credit exhausted "
-                    f"({result.credit_exhausted_reason}); retrying planner with {alt_tool}:{alt_model}.",
+                    f"({sanitize_terminal_text(result.credit_exhausted_reason)}); retrying planner with {alt_tool}:{alt_model}.",
                     file=sys.stderr,
                 )
                 planner_tool, planner_model = alt_tool, alt_model
