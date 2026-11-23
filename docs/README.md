@@ -1,5 +1,7 @@
 # ai-router (`ai-route`) ドキュメント
 
+> **Languages:** [English](en/README.md) | **日本語**
+
 `ai-router`（CLI コマンド: `ai-route` / `ai-router`）の詳細な使い方・設定リファレンス・各サービス連携仕様をまとめたドキュメントです。
 
 ## 目次

@@ -1,5 +1,7 @@
 # 対応サービス・ACP モード・クレジット切れフェイルオーバー
 
+> **Languages:** [English](en/services-and-failover.md) | **日本語**
+
 ---
 
 ## 1. 対応サービス一覧と CLI 呼び出し仕様

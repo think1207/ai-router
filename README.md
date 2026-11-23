@@ -2,10 +2,10 @@
 
 A unified CLI that classifies coding task difficulty & reasoning effort and orchestrates multiple AI coding agents (**opencode**, **agy (ACP)**, **claude**, **copilot**, **codex**) using `git worktree` and `tmux`.
 
-> **詳細なドキュメント:** 詳しい使い方・設定リファレンス・各サービス仕様は [`docs/`](docs/README.md) を参照してください。
-> - [使い方ガイド (`docs/usage.md`)](docs/usage.md)
-> - [設定リファレンス (`docs/configuration.md`)](docs/configuration.md)
-> - [対応サービス・ACP・クレジット切れフェイルオーバー (`docs/services-and-failover.md`)](docs/services-and-failover.md)
+> **Documentation:** Full guides, configuration reference, and service/ACP specs are available in **English** ([`docs/en/`](docs/en/README.md)) and **日本語** ([`docs/`](docs/README.md)):
+> - Usage Guide: [English](docs/en/usage.md) | [日本語](docs/usage.md)
+> - Configuration Reference: [English](docs/en/configuration.md) | [日本語](docs/configuration.md)
+> - Services, ACP Mode & Credit Failover: [English](docs/en/services-and-failover.md) | [日本語](docs/services-and-failover.md)
 
 ## Features
 

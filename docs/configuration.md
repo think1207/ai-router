@@ -1,5 +1,7 @@
 # 設定リファレンス (`config.toml` & 環境変数)
 
+> **Languages:** [English](en/configuration.md) | **日本語**
+
 `ai-router` は設定ファイルなしでも組み込みデフォルトでそのまま動作しますが、`~/.config/ai-route/config.toml` を用意することで、利用モデル・サブスクリプション・ルーター・日常の既定フラグを自由にカスタマイズできます。
 
 ---
