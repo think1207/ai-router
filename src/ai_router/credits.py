@@ -26,6 +26,7 @@ from ai_router.config import (
     get_provider_state_file,
     get_strong_credit_patterns,
 )
+from ai_router.tools import is_tool_installed
 from ai_router.utils import now_iso
 
 _DIFFICULTY_ORDER: tuple[str, ...] = ("low", "medium", "high")
@@ -210,6 +211,10 @@ def select_alternative_candidate(
     cfg = config or get_active_config()
     excluded = excluded_tools or set()
     pool = [c for c in cfg.candidates if c["tool"] not in excluded]
+    if cfg.auto_detect_tools:
+        installed_pool = [c for c in pool if is_tool_installed(c["tool"])]
+        if installed_pool:
+            pool = installed_pool
     if not pool:
         return None
 

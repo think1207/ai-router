@@ -1,4 +1,4 @@
-"""Agent shell command builders, headless execution, and tmux dispatch helpers."""
+"""Agent shell command builders, headless execution (incl. ACP for `agy`), and tmux dispatch."""
 
 from __future__ import annotations
 
@@ -9,14 +9,21 @@ import tempfile
 import time
 from pathlib import Path
 
+from ai_router.acp import RC_COMMAND_NOT_FOUND, RC_TIMEOUT, run_acp_headless_once
 from ai_router.config import (
     AGY_PASTE_DELAY_SEC,
     AGY_PASTE_FALLBACK,
     OPENCODE_ATTACH_URL,
+    get_active_config,
     get_session_log_dir,
 )
 from ai_router.errors import AiRouteError
 from ai_router.models import DispatchEntry
+from ai_router.tools import (
+    build_tool_headless_argv,
+    build_tool_shell_invocation,
+    get_tool_adapter,
+)
 from ai_router.utils import run_cmd
 
 
@@ -33,8 +40,6 @@ def resolve_workdir(path: Path | str) -> Path:
 
     Every launch path (tmux ``-c``, the tmux client's own cwd, ``cd`` in the pane's shell,
     ``os.chdir`` outside tmux) goes through this so they all agree on the same directory.
-    A missing directory is rejected up front: tmux would otherwise silently fall back to
-    ``$HOME``, and ``subprocess`` would report a misleading "tmux: not found".
     """
     resolved = Path(path).expanduser().resolve()
     if not resolved.exists():
@@ -45,21 +50,12 @@ def resolve_workdir(path: Path | str) -> Path:
 
 
 def _with_cd(shell_cmd: str, workdir: Path) -> str:
-    """Prefix `shell_cmd` with ``cd <workdir> &&`` so it only runs in that directory.
-
-    The command is brace-grouped because it is a ``;``-separated sequence: without the group
-    only its first statement would be guarded and the rest (including the final
-    ``exec "$SHELL"``) would still run in the wrong directory if ``cd`` failed.
-    """
+    """Prefix `shell_cmd` with ``cd <workdir> &&`` so it only runs in that directory."""
     return f"cd {shlex.quote(str(workdir))} && {{ {shell_cmd}; }}"
 
 
 def _absolute(path: Path | str) -> Path:
-    """Make `path` absolute (without resolving symlinks) for embedding in a shell command.
-
-    Such commands run in another process/cwd (the pane after ``cd``, or tmux's pipe-pane
-    job), so a relative path would point somewhere else than where it was computed.
-    """
+    """Make `path` absolute (without resolving symlinks) for embedding in a shell command."""
     return Path(os.path.abspath(os.path.expanduser(path)))
 
 
@@ -73,30 +69,24 @@ def _agent_invocation(
     model: str,
     pf: str,
     mode: str,
-    agy_paste_fallback: bool,
+    agy_paste_fallback: bool = False,  # kept for signature compatibility; agy always uses ACP
     effort: str = "",
+    acp_mode: str = "",
 ) -> str:
-    m = shlex.quote(model)
-    effort_flag = f"--effort {shlex.quote(effort)} " if effort else ""
-    if tool == "claude":
-        if mode == "headless":
-            return f'claude --model {m} {effort_flag}-p "$(cat {pf})"'
-        return f'claude --model {m} {effort_flag}"$(cat {pf})"'
-
-    if tool == "opencode":
-        attach_flag = f"--attach {shlex.quote(OPENCODE_ATTACH_URL)} " if OPENCODE_ATTACH_URL else ""
-        if mode == "headless":
-            return f'opencode run {attach_flag}-m {m} "$(cat {pf})"'
-        return f'opencode -m {m} --prompt "$(cat {pf})"'
-
-    if tool == "agy":
-        if mode == "headless":
-            return f'agy --model {m} {effort_flag}-p "$(cat {pf})"'
-        if agy_paste_fallback:
-            return f"agy --model {m}" + (f" --effort {shlex.quote(effort)}" if effort else "")
-        return f'agy --model {m} {effort_flag}--prompt-interactive "$(cat {pf})"'
-
-    raise ValueError(f"Unsupported tool: {tool}")
+    del agy_paste_fallback
+    cfg = get_active_config()
+    attach_url = OPENCODE_ATTACH_URL or cfg.opencode_attach_url
+    effective_acp_mode = acp_mode or cfg.agy_acp_mode or "auto"
+    return build_tool_shell_invocation(
+        tool,
+        model,
+        pf,
+        mode,
+        effort=effort,
+        opencode_attach_url=attach_url,
+        agy_acp_mode=effective_acp_mode,
+        copilot_permission_flag=cfg.copilot_permission_flag,
+    )
 
 
 def build_agent_shell_cmd(
@@ -108,16 +98,19 @@ def build_agent_shell_cmd(
     agy_paste_fallback: bool = AGY_PASTE_FALLBACK,
     log_path: Path | None = None,
     effort: str = "",
+    acp_mode: str = "",
 ) -> str:
     """Build the shell command string executed inside a tmux pane or current shell.
 
+    `agy` always runs via ACP mode (`agy acp --stdio`) through the built-in ACP bridge.
     With ``log_path``, the agent's exit code is echoed as ``[ai-route] exit=N`` and, in
     headless mode, all output is also tee'd into the log so `ai-route status` can inspect
-    it later. Interactive output is captured separately via ``tmux pipe-pane`` (piping a
-    TUI would break its TTY). Without ``log_path`` the command is unchanged.
+    it later.
     """
     pf = shlex.quote(str(prompt_file))
-    invocation = _agent_invocation(tool, model, pf, mode, agy_paste_fallback, effort=effort)
+    invocation = _agent_invocation(
+        tool, model, pf, mode, agy_paste_fallback, effort=effort, acp_mode=acp_mode
+    )
     tail = f'rm -f {pf}; exec "$SHELL"'
     if log_path is None:
         return f"{invocation}; {tail}"
@@ -152,11 +145,6 @@ def _pipe_pane_to_log(pane_id: str, log_path: Path) -> None:
     )
 
 
-# Shell-style return codes reported when an agent could not run to completion
-RC_COMMAND_NOT_FOUND = 127
-RC_TIMEOUT = 124
-
-
 def _to_text(data: str | bytes | None) -> str:
     if data is None:
         return ""
@@ -173,30 +161,42 @@ def run_agent_headless_once(
     *,
     timeout: float | None = None,
     effort: str = "",
+    read_only: bool = False,
+    acp_mode: str = "",
 ) -> tuple[int, str, int]:
     """Run a single agent non-interactively and return `(returncode, output, latency_ms)`.
+
+    `agy` always executes via ACP mode (`agy acp --stdio`), defaulting to `auto` mode
+    (or `plan` mode when `read_only=True`, such as planner/review/router stages).
 
     Launch failures never raise: a missing executable (or other ``OSError``) is reported
     as ``RC_COMMAND_NOT_FOUND`` (127) and a timeout as ``RC_TIMEOUT`` (124), with the
     reason included in ``output``.
     """
-    if tool == "claude":
-        cmd = ["claude", "--model", model]
-        if effort:
-            cmd.extend(["--effort", effort])
-        cmd.extend(["-p", prompt])
-    elif tool == "agy":
-        cmd = ["agy", "--model", model]
-        if effort:
-            cmd.extend(["--effort", effort])
-        cmd.extend(["-p", prompt])
-    elif tool == "opencode":
-        cmd = ["opencode", "run"]
-        if OPENCODE_ATTACH_URL:
-            cmd.extend(["--attach", OPENCODE_ATTACH_URL])
-        cmd.extend(["-m", model, prompt])
-    else:
-        raise ValueError(f"Unsupported tool: {tool}")
+    cfg = get_active_config()
+    adapter = get_tool_adapter(tool)
+    if adapter is not None and adapter.uses_acp:
+        effective_acp_mode = acp_mode or cfg.agy_acp_mode or "auto"
+        return run_acp_headless_once(
+            adapter.acp_cmd(),
+            model,
+            prompt,
+            cwd,
+            timeout=timeout,
+            effort=effort,
+            acp_mode=effective_acp_mode,
+            read_only=read_only,
+        )
+
+    attach_url = OPENCODE_ATTACH_URL or cfg.opencode_attach_url
+    cmd = build_tool_headless_argv(
+        tool,
+        model,
+        prompt,
+        effort=effort,
+        opencode_attach_url=attach_url,
+        copilot_permission_flag=cfg.copilot_permission_flag,
+    )
 
     t0 = time.monotonic()
     try:
@@ -236,12 +236,7 @@ def dispatch_to_tmux(
     pane_title: str = "",
     log_path: Path | None = None,
 ) -> None:
-    """Launch an agent inside a new tmux window/pane, or exec directly if outside tmux.
-
-    The agent always starts in `workdir` (resolved to an absolute path, which must exist):
-    tmux gets it via ``-c``, the tmux client runs with it as its cwd, and the pane's shell
-    command begins with ``cd <workdir> &&`` as a fallback.
-    """
+    """Launch an agent inside a new tmux window/pane, or exec directly if outside tmux."""
     workdir = resolve_workdir(workdir)
 
     if not os.environ.get("TMUX"):
@@ -291,12 +286,7 @@ def dispatch_to_tmux(
 
 
 def dispatch_tiled_panes(*, win_name: str, entries: list[DispatchEntry]) -> None:
-    """Open a new tmux window with multiple tiled panes running agents in parallel.
-
-    Every pane gets the same cwd guarantees as `dispatch_to_tmux`. All entries' workdirs are
-    validated before the first window is created, so a bad entry never leaves a half-built
-    window behind.
-    """
+    """Open a new tmux window with multiple tiled panes running agents in parallel."""
     if not os.environ.get("TMUX"):
         raise AiRouteError("Parallel interactive mode requires running inside a tmux session.")
 

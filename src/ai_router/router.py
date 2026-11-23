@@ -1,10 +1,11 @@
-"""Lightweight task difficulty & effort classification and routing via OpenCode."""
+"""Lightweight task difficulty & effort classification and multi-service routing."""
 
 from __future__ import annotations
 
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from ai_router.config import (
     DIFFICULTY_TO_DEFAULT_EFFORT,
@@ -18,8 +19,12 @@ from ai_router.credits import (
     mark_tool_exhausted,
     select_alternative_candidate,
 )
+from ai_router.dispatch import run_agent_headless_once
 from ai_router.models import RouteDecision
+from ai_router.tools import BUILTIN_TOOL_ADAPTERS, get_tool_adapter, is_tool_installed
 from ai_router.utils import append_plan_first, extract_first_json_object, run_cmd, sanitize_slug
+
+_DEFAULT_ROUTER_FALLBACK_ORDER: tuple[str, ...] = ("opencode", "agy", "copilot", "claude", "codex")
 
 
 def build_router_prompt(
@@ -104,7 +109,14 @@ def _fallback_decision(
     fb = dict(fallback_decision if fallback_decision is not None else cfg.fallback_decision)
     excluded = excluded_tools or set()
 
-    if fb.get("tool") in excluded:
+    fb_tool = str(fb.get("tool", ""))
+    has_installed_alt = any(
+        is_tool_installed(c["tool"]) for c in cfg.candidates if c["tool"] not in excluded
+    )
+    need_alt = fb_tool in excluded or (
+        cfg.auto_detect_tools and has_installed_alt and not is_tool_installed(fb_tool)
+    )
+    if need_alt:
         alt = select_alternative_candidate(
             fb.get("difficulty", "medium"),
             excluded_tools=excluded,
@@ -115,7 +127,7 @@ def _fallback_decision(
             fb["tool"] = alt_tool
             fb["model"] = alt_model
             fb["effort"] = fb.get("effort") or alt_effort
-            fb["reason"] = f"Fallback routed to alternative service ({alt_tool}) due to credit exhaustion"
+            fb["reason"] = f"Fallback routed to alternative service ({alt_tool})"
 
     fb.setdefault("effort", DIFFICULTY_TO_DEFAULT_EFFORT.get(fb.get("difficulty", "medium"), "medium"))
     return RouteDecision(
@@ -124,6 +136,100 @@ def _fallback_decision(
         router_latency_ms=latency_ms,
         is_fallback=True,
     )
+
+
+def _router_model_for_tool(tool: str, cfg: AppConfig) -> str:
+    if tool == "opencode" or (cfg.router_tool and tool == cfg.router_tool):
+        return cfg.router_model
+    # Prefer the lowest-difficulty configured candidate for this tool, else built-in default
+    tool_cands = [c for c in cfg.candidates if c["tool"] == tool]
+    if tool_cands:
+        diff_rank = {"low": 0, "medium": 1, "high": 2}
+        best = min(tool_cands, key=lambda c: diff_rank.get(c["difficulty"], 1))
+        return best["model"]
+    adapter = get_tool_adapter(tool)
+    return adapter.default_router_model if adapter else cfg.router_model
+
+
+def resolve_router_service(
+    cfg: AppConfig,
+    *,
+    excluded_tools: set[str] | None = None,
+) -> tuple[str, str] | None:
+    """Resolve the `(router_tool, router_model)` to use for classification.
+
+    - If `cfg.router_tool` is explicitly configured, uses it (unless exhausted).
+    - If `cfg.router_fallback_tools` is configured, tries tools in that order (skipping
+      exhausted or uninstalled ones).
+    - Otherwise uses `opencode` when installed; if `opencode` is NOT installed on the host,
+      automatically selects the first installed, non-exhausted alternative service so
+      environments without `opencode` still get intelligent routing.
+    """
+    excluded = excluded_tools or set()
+
+    if cfg.router_tool:
+        if cfg.router_tool in excluded:
+            # Try explicit fallback tools if configured
+            for t in cfg.router_fallback_tools:
+                if t not in excluded and (not cfg.auto_detect_tools or is_tool_installed(t)):
+                    return t, _router_model_for_tool(t, cfg)
+            return None
+        return cfg.router_tool, _router_model_for_tool(cfg.router_tool, cfg)
+
+    if cfg.router_fallback_tools:
+        for t in cfg.router_fallback_tools:
+            if t not in excluded and (not cfg.auto_detect_tools or is_tool_installed(t)):
+                return t, _router_model_for_tool(t, cfg)
+        return None
+
+    # Default behavior: prefer opencode if installed (or when auto_detect_tools is off)
+    opencode_installed = is_tool_installed("opencode")
+    if opencode_installed or not cfg.auto_detect_tools:
+        if "opencode" in excluded:
+            return None
+        return "opencode", cfg.router_model
+
+    # `opencode` is not installed on this machine: auto-pick an installed alternative router
+    for t in _DEFAULT_ROUTER_FALLBACK_ORDER:
+        if t == "opencode" or t in excluded:
+            continue
+        if t in BUILTIN_TOOL_ADAPTERS and is_tool_installed(t):
+            return t, _router_model_for_tool(t, cfg)
+    if "opencode" not in excluded:
+        return "opencode", cfg.router_model
+    return None
+
+
+def _invoke_router(
+    router_tool: str,
+    router_model: str,
+    prompt: str,
+    *,
+    timeout: float | None,
+    cfg: AppConfig,
+) -> tuple[int, str, str, int]:
+    """Invoke the chosen router service and return `(returncode, stdout, stderr, latency_ms)`."""
+    if router_tool == "opencode":
+        cmd = ["opencode", "run"]
+        if cfg.opencode_attach_url:
+            cmd.extend(["--attach", cfg.opencode_attach_url])
+        cmd.extend(["-m", router_model, prompt])
+        t0 = time.monotonic()
+        res = run_cmd(cmd, check=False, timeout=timeout)
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        return res.returncode, res.stdout or "", res.stderr or "", latency_ms
+
+    # Non-opencode routers (e.g. agy via ACP plan mode, copilot, claude, codex)
+    rc, output, latency_ms = run_agent_headless_once(
+        router_tool,
+        router_model,
+        prompt,
+        Path.cwd(),
+        timeout=timeout,
+        effort="low",
+        read_only=True,
+    )
+    return rc, output, "" if rc == 0 else output, latency_ms
 
 
 def route_task(
@@ -138,17 +244,18 @@ def route_task(
 ) -> RouteDecision:
     """Invoke the lightweight router model and return a validated RouteDecision.
 
-    Never raises for router-side failures: a missing `opencode` binary, a timeout, a
-    non-zero exit, unparsable output, credit exhaustion, or a disallowed model all yield
-    a fallback decision (preferring services that are not credit-exhausted).
+    Automatically filters out credit-exhausted services and (when `auto_detect_tools` is
+    enabled) uninstalled CLIs. Supports multi-service routing when `opencode` is absent or
+    when `router_tool` / `router_fallback_tools` are configured.
 
-    When `plan_first` is True, PLAN_FIRST_INSTRUCTION is appended to `refined_prompt` on
-    every path (including fallbacks), regardless of the classified difficulty.
+    Never raises for router-side failures: a missing binary, timeout, non-zero exit,
+    unparsable output, credit exhaustion, or disallowed model all yield a fallback decision.
     """
     cfg = config or get_active_config()
     exhausted = set(get_exhausted_tools().keys())
     effective_excluded = exhausted | set(excluded_tools or ())
 
+    # Filter candidates by credit exhaustion and (optionally) installed CLI detection
     active_candidates = [c for c in cfg.candidates if c["tool"] not in effective_excluded]
     if active_candidates and effective_excluded:
         skipped = ", ".join(sorted(effective_excluded & {c["tool"] for c in cfg.candidates}))
@@ -163,11 +270,15 @@ def route_task(
         active_candidates = list(cfg.candidates)
         effective_excluded = set()
 
-    # If the router service itself ('opencode') is already marked credit-exhausted,
-    # skip waiting on it and fall back immediately to an available alternative service.
-    if "opencode" in effective_excluded:
+    if cfg.auto_detect_tools:
+        installed_cands = [c for c in active_candidates if is_tool_installed(c["tool"])]
+        if installed_cands:
+            active_candidates = installed_cands
+
+    router_choice = resolve_router_service(cfg, excluded_tools=effective_excluded)
+    if router_choice is None:
         print(
-            "[warn] Router service 'opencode' is currently marked credit-exhausted. "
+            "[warn] No available router service (credit-exhausted or uninstalled). "
             "Routing to an available alternative service.",
             file=sys.stderr,
         )
@@ -175,15 +286,14 @@ def route_task(
             task, 0, plan_first, cfg.fallback_decision, excluded_tools=effective_excluded, config=cfg
         )
 
+    router_tool, router_model = router_choice
     prompt = build_router_prompt(task, repo_ctx, files_ctx, candidates=active_candidates)
-    cmd = ["opencode", "run"]
-    if cfg.opencode_attach_url:
-        cmd.extend(["--attach", cfg.opencode_attach_url])
-    cmd.extend(["-m", cfg.router_model, prompt])
 
     t0 = time.monotonic()
     try:
-        res = run_cmd(cmd, check=False, timeout=timeout)
+        rc, stdout_text, stderr_text, latency_ms = _invoke_router(
+            router_tool, router_model, prompt, timeout=timeout, cfg=cfg
+        )
     except subprocess.TimeoutExpired:
         latency_ms = int((time.monotonic() - t0) * 1000)
         print(f"[warn] Router timed out after {timeout:g}s. Falling back.", file=sys.stderr)
@@ -196,26 +306,38 @@ def route_task(
         return _fallback_decision(
             task, latency_ms, plan_first, cfg.fallback_decision, excluded_tools=effective_excluded, config=cfg
         )
-    latency_ms = int((time.monotonic() - t0) * 1000)
 
-    if res.returncode != 0:
-        combined = f"{res.stdout or ''}\n{res.stderr or ''}".strip()
-        credit_reason = detect_credit_exhausted(res.returncode, combined)
+    if rc != 0:
+        combined = f"{stdout_text}\n{stderr_text}".strip()
+        credit_reason = detect_credit_exhausted(rc, combined)
         if credit_reason:
-            mark_tool_exhausted("opencode", credit_reason, model=cfg.router_model)
-            effective_excluded.add("opencode")
+            mark_tool_exhausted(router_tool, credit_reason, model=router_model)
+            effective_excluded.add(router_tool)
             print(
-                f"[warn] Router service 'opencode' credit exhausted ({credit_reason}). "
+                f"[warn] Router service '{router_tool}' credit exhausted ({credit_reason}). "
                 "Routing to an alternative service.",
                 file=sys.stderr,
             )
+            # If alternative router fallback tools are configured, try the next one once
+            if cfg.router_fallback_tools:
+                next_router = resolve_router_service(cfg, excluded_tools=effective_excluded)
+                if next_router is not None and next_router[0] != router_tool:
+                    return route_task(
+                        task,
+                        repo_ctx,
+                        files_ctx,
+                        plan_first,
+                        timeout=timeout,
+                        config=cfg,
+                        excluded_tools=effective_excluded,
+                    )
         else:
-            print(f"[warn] Router execution failed: {res.stderr.strip()}", file=sys.stderr)
+            print(f"[warn] Router execution failed: {stderr_text.strip()}", file=sys.stderr)
         return _fallback_decision(
             task, latency_ms, plan_first, cfg.fallback_decision, excluded_tools=effective_excluded, config=cfg
         )
 
-    parsed = extract_first_json_object(res.stdout)
+    parsed = extract_first_json_object(stdout_text)
     if not parsed:
         print("[warn] Failed to parse JSON from router output. Falling back.", file=sys.stderr)
         return _fallback_decision(

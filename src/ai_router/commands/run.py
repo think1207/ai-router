@@ -85,7 +85,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             )
         decision = RouteDecision(
             difficulty="manual",
-            effort=cli_effort,
+            effort=cli_effort or cfg.defaults.effort,
             tool=args.tool,
             model=args.model,
             branch_slug=sanitize_slug(args.slug or "manual-task"),

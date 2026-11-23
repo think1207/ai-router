@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import select
 import sys
 from pathlib import Path
 
@@ -106,8 +107,36 @@ def format_files_for_agent(files: list[ResolvedFile], *, using_worktree: bool) -
     return "\n".join(lines)
 
 
+def _read_piped_stdin(*, has_task_arg: bool) -> str:
+    """Read piped/redirected stdin automatically when non-interactive.
+
+    When `has_task_arg` is False, reads any non-TTY stdin (including StringIO mocks in tests).
+    When `has_task_arg` is True, only reads when a real pipe/file descriptor has data
+    immediately available, avoiding hangs or interference with test runners.
+    """
+    try:
+        if sys.stdin.isatty():
+            return ""
+    except (AttributeError, OSError):
+        return ""
+
+    if has_task_arg:
+        try:
+            fd = sys.stdin.fileno()
+            ready, _, _ = select.select([fd], [], [], 0.0)
+            if not ready:
+                return ""
+        except (AttributeError, OSError, ValueError):
+            return ""
+
+    try:
+        return sys.stdin.read().strip()
+    except OSError:
+        return ""
+
+
 def load_task_text(task_arg: str | None, task_file: str | None) -> str:
-    """Combine positional task text with `--task-file` (or stdin when `'-'`)."""
+    """Combine positional task text with `--task-file` (or automatically detected piped stdin)."""
     parts: list[str] = []
     if task_file:
         if task_file == "-":
@@ -117,10 +146,14 @@ def load_task_text(task_arg: str | None, task_file: str | None) -> str:
             if not tf.is_file():
                 raise AiRouteError(f"Task file not found: {task_file}")
             parts.append(tf.read_text(encoding="utf-8").strip())
+    else:
+        piped = _read_piped_stdin(has_task_arg=bool(task_arg))
+        if piped:
+            parts.append(piped)
     if task_arg:
         parts.append(task_arg.strip())
 
     combined = "\n\n".join(p for p in parts if p)
     if not combined:
-        raise AiRouteError("Please provide a task description argument or --task-file.")
+        raise AiRouteError("Please provide a task description argument, --task-file, or piped stdin.")
     return combined
