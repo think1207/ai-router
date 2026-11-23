@@ -35,6 +35,7 @@ from ai_router.dispatch import (
 )
 from ai_router.errors import AiRouteError
 from ai_router.models import BlockSignal
+from ai_router.security import redact_secrets, sanitize_terminal_text
 from ai_router.sessions import append_history, build_session_meta
 from ai_router.storage import append_jsonl, save_session_meta
 from ai_router.twostage import build_escalation_prompt, build_resume_prompt, extract_plan, resolve_spec
@@ -108,7 +109,7 @@ def record_credit_exhausted(
             "model": model,
             "stage": stage,
             "source": source,
-            "reason": reason,
+            "reason": redact_secrets(reason),
         }
     )
 
@@ -162,7 +163,7 @@ def run_and_record(
 
     log_path = begin_session_log(session_id, tool, model)
     with log_path.open("a", encoding="utf-8") as f:
-        f.write(f"{output}\n{EXIT_LINE_PREFIX}{rc}\n")
+        f.write(f"{redact_secrets(output)}\n{EXIT_LINE_PREFIX}{rc}\n")
 
     repo, branch = get_repo_and_branch(workdir)
     append_jsonl(
@@ -266,7 +267,7 @@ def escalate_session(
                     alt_tool, alt_model, _ = alt
                     print(
                         f"[failover] Escalation service {cur_tool}:{cur_model} credit exhausted "
-                        f"({credit_reason}); retrying with {alt_tool}:{alt_model}.",
+                        f"({sanitize_terminal_text(credit_reason)}); retrying with {alt_tool}:{alt_model}.",
                         file=sys.stderr,
                     )
                     cur_tool, cur_model = alt_tool, alt_model
@@ -386,7 +387,7 @@ def launch_implementer(
                 break
             alt_tool, alt_model, alt_effort = alt
             print(
-                f"[failover] Credit exhausted on {cur_tool}:{cur_model} ({result.credit_exhausted_reason}); "
+                f"[failover] Credit exhausted on {cur_tool}:{cur_model} ({sanitize_terminal_text(result.credit_exhausted_reason)}); "
                 f"routing to {alt_tool}:{alt_model}.",
                 file=sys.stderr,
             )

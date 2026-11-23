@@ -26,10 +26,13 @@ from ai_router.config import (
     get_provider_state_file,
     get_strong_credit_patterns,
 )
+from ai_router.security import ensure_private_dir, ensure_private_file, redact_secrets
 from ai_router.tools import is_tool_installed
 from ai_router.utils import now_iso
 
 _DIFFICULTY_ORDER: tuple[str, ...] = ("low", "medium", "high")
+_CREDIT_SCAN_MAX_CHARS: int = 64 * 1024
+_CREDIT_LINE_MAX_CHARS: int = 1024
 
 
 def _now_utc() -> datetime.datetime:
@@ -38,17 +41,19 @@ def _now_utc() -> datetime.datetime:
 
 def _match_patterns(text: str, patterns: list[re.Pattern[str]]) -> str | None:
     """Return the first matching line (trimmed) if any pattern hits `text`, else None."""
-    for line in text.splitlines():
+    bounded = text[-_CREDIT_SCAN_MAX_CHARS:] if len(text) > _CREDIT_SCAN_MAX_CHARS else text
+    for line in bounded.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
+        candidate = stripped[:_CREDIT_LINE_MAX_CHARS]
         for pat in patterns:
-            if pat.search(stripped):
-                return stripped[:200]
+            if pat.search(candidate):
+                return redact_secrets(candidate[:200])
     for pat in patterns:
-        m = pat.search(text)
+        m = pat.search(bounded)
         if m:
-            return m.group(0).strip()[:200]
+            return redact_secrets(m.group(0).strip()[:200])
     return None
 
 
@@ -93,7 +98,7 @@ def load_provider_state(path: Path | None = None) -> dict[str, Any]:
 def save_provider_state(state: dict[str, Any], path: Path | None = None) -> None:
     """Atomically/safely persist provider state JSON with an exclusive file lock."""
     target = path or get_provider_state_file()
-    target.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(target.parent)
     payload = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
     with target.open("a+", encoding="utf-8") as f:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -104,6 +109,7 @@ def save_provider_state(state: dict[str, Any], path: Path | None = None) -> None
             f.flush()
         finally:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    ensure_private_file(target)
 
 
 def _parse_iso(ts: str) -> datetime.datetime | None:
@@ -154,7 +160,7 @@ def mark_tool_exhausted(
     entry = {
         "since": now_dt.isoformat(timespec="seconds"),
         "until": until_dt.isoformat(timespec="seconds"),
-        "reason": reason,
+        "reason": redact_secrets(reason),
         "model": model,
     }
     state = load_provider_state(path)

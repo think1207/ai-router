@@ -17,6 +17,8 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from ai_router.security import validate_copilot_permission_flag
+
 
 @dataclasses.dataclass(frozen=True)
 class ToolAdapter:
@@ -152,7 +154,8 @@ def build_tool_shell_invocation(
     if tool == "copilot":
         effort_flag = f"--reasoning-effort {shlex.quote(eff)} " if eff else ""
         if mode == "headless":
-            perm_flag = f"{copilot_permission_flag} " if copilot_permission_flag else ""
+            perm_tokens = validate_copilot_permission_flag(copilot_permission_flag)
+            perm_flag = f"{shlex.join(perm_tokens)} " if perm_tokens else ""
             return f'copilot --model {m} {effort_flag}{perm_flag}-s -p "$(cat {prompt_file_quoted})"'
         return f'copilot --model {m} {effort_flag}-i "$(cat {prompt_file_quoted})"'
 
@@ -195,8 +198,9 @@ def build_tool_headless_argv(
         cmd = ["copilot", "--model", model]
         if eff:
             cmd.extend(["--reasoning-effort", eff])
-        if copilot_permission_flag:
-            cmd.extend(shlex.split(copilot_permission_flag))
+        perm_tokens = validate_copilot_permission_flag(copilot_permission_flag)
+        if perm_tokens:
+            cmd.extend(perm_tokens)
         cmd.extend(["-s", "-p", prompt])
         return cmd
 

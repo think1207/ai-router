@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ai_router.config import get_test_cmd_timeout
 from ai_router.errors import AiRouteError
+from ai_router.security import validate_git_ref
 from ai_router.utils import get_git_root, run_cmd
 
 
@@ -42,9 +43,10 @@ def cmd_clean(args: argparse.Namespace) -> None:
     print(f"Removed worktree: {target}")
 
     if args.delete_branch and branch_name and branch_name.startswith("ai/"):
+        safe_branch = validate_git_ref(branch_name, "branch name")
         del_flag = "-D" if args.force else "-d"
-        run_cmd(["git", "branch", del_flag, branch_name], cwd=repo_root, capture=False)
-        print(f"Deleted branch: {branch_name}")
+        run_cmd(["git", "branch", del_flag, safe_branch], cwd=repo_root, capture=False)
+        print(f"Deleted branch: {safe_branch}")
 
 
 def _parse_worktree_list(repo_root: Path) -> list[dict[str, str]]:
@@ -100,6 +102,9 @@ def cmd_done(args: argparse.Namespace) -> None:
     branch = run_cmd(["git", "branch", "--show-current"], cwd=target_wt, check=False).stdout.strip()
     if not branch:
         raise AiRouteError(f"Worktree {target_wt} is on a detached HEAD; cannot finish automatically.")
+    branch = validate_git_ref(branch, "branch name")
+    if main_branch:
+        main_branch = validate_git_ref(main_branch, "main branch")
     if target_wt == main_wt and not args.pr:
         raise AiRouteError("Cannot merge the main worktree into itself (use --pr to create a pull request).")
 
@@ -126,12 +131,12 @@ def cmd_done(args: argparse.Namespace) -> None:
         print(f"[test] Running: {args.test_cmd}")
         if not args.dry_run:
             try:
-                res = subprocess.run(
-                    args.test_cmd,
-                    shell=True,
-                    cwd=str(target_wt),
-                    timeout=timeout,
+                res = run_cmd(
+                    ["bash", "-lc", args.test_cmd],
+                    cwd=target_wt,
                     check=False,
+                    capture=False,
+                    timeout=timeout,
                 )
             except subprocess.TimeoutExpired:
                 raise AiRouteError(f"Test command timed out after {timeout:g}s: {args.test_cmd}")

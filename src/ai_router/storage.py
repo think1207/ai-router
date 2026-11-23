@@ -9,13 +9,14 @@ from pathlib import Path
 from typing import Any
 
 from ai_router.config import get_log_file
+from ai_router.security import ensure_private_dir, ensure_private_file
 from ai_router.utils import get_git_dir
 
 
 def append_jsonl(record: dict[str, Any], *, log_file: Path | None = None) -> None:
     """Append a single JSON record to the history log file with an exclusive file lock."""
     target = log_file or get_log_file()
-    target.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(target.parent)
     line = json.dumps(record, ensure_ascii=False) + "\n"
     with target.open("a", encoding="utf-8") as f:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -24,6 +25,7 @@ def append_jsonl(record: dict[str, Any], *, log_file: Path | None = None) -> Non
             f.flush()
         finally:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    ensure_private_file(target)
 
 
 def load_jsonl(log_file: Path | None = None, *, warn_malformed: bool = True) -> list[dict[str, Any]]:
@@ -63,6 +65,7 @@ def save_session_meta(workdir: Path, meta: dict[str, Any]) -> None:
     if not path:
         return
     path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    ensure_private_file(path)
 
 
 def load_session_meta(workdir: Path) -> dict[str, Any] | None:

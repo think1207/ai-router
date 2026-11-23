@@ -28,6 +28,12 @@ from ai_router.errors import AiRouteError
 from ai_router.files import format_files_for_agent, resolve_files
 from ai_router.flow import launch_implementer
 from ai_router.models import DispatchEntry
+from ai_router.security import (
+    MAX_READ_FILE_BYTES,
+    ensure_private_dir,
+    ensure_private_file,
+    validate_git_ref,
+)
 from ai_router.sessions import build_session_meta
 from ai_router.storage import append_jsonl, save_session_meta
 from ai_router.twostage import PLAN_JSON_SCHEMA, build_implementation_prompt, extract_plan, resolve_implementer
@@ -63,9 +69,16 @@ def collect_review_target(args: argparse.Namespace, cwd: Path, repo_root: Path |
         resolved = resolve_files(args.files, repo_root)
         for rf in resolved:
             try:
-                content = rf.abs_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                content = "(binary file)"
+                file_size = rf.abs_path.stat().st_size
+            except OSError:
+                file_size = 0
+            if file_size > MAX_READ_FILE_BYTES:
+                content = f"(file too large: {file_size} bytes > {MAX_READ_FILE_BYTES} bytes; skipped)"
+            else:
+                try:
+                    content = rf.abs_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    content = "(binary file)"
             sections.append(f"### File: {rf.display_path}\n```\n{content}\n```")
 
     if not args.files or args.include_diff:
@@ -74,8 +87,9 @@ def collect_review_target(args: argparse.Namespace, cwd: Path, repo_root: Path |
                 diff_cmd = ["git", "diff", "--cached"]
                 label = "git diff --cached"
             elif args.base:
-                diff_cmd = ["git", "diff", f"{args.base}...HEAD"]
-                label = f"git diff {args.base}...HEAD"
+                safe_base = validate_git_ref(args.base, "base ref")
+                diff_cmd = ["git", "diff", f"{safe_base}...HEAD"]
+                label = f"git diff {safe_base}...HEAD"
             else:
                 diff_cmd = ["git", "diff", "HEAD"]
                 label = "git diff HEAD"
@@ -264,8 +278,9 @@ def cmd_review(args: argparse.Namespace) -> None:
         if args.output
         else (get_log_file().parent / "reviews" / f"review-{group_id}.md")
     )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(out_path.parent)
     out_path.write_text(full_report, encoding="utf-8")
+    ensure_private_file(out_path)
 
     append_jsonl(
         {

@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from ai_router.security import is_dangerous_acp_action, sanitize_terminal_text
+
 # Shell-style return codes (shared with dispatch.py)
 RC_COMMAND_NOT_FOUND = 127
 RC_TIMEOUT = 124
@@ -140,14 +142,30 @@ def _pick_permission_option(
     return {"outcome": {"outcome": "cancelled"}}
 
 
+def _auto_permission_handler(params: dict[str, Any], *, allow: bool) -> dict[str, Any]:
+    """Automatically approve/reject ACP permissions while blocking destructive shell actions."""
+    if allow:
+        danger = is_dangerous_acp_action(params)
+        if danger:
+            print(
+                f"[warn] ACP blocked dangerous action in auto mode: {sanitize_terminal_text(danger)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return _pick_permission_option(params, allow=False)
+    return _pick_permission_option(params, allow=allow)
+
+
 def _interactive_permission_handler(params: dict[str, Any]) -> dict[str, Any]:
     """Prompt the user in the terminal to approve/reject an ACP permission request."""
     tool_call = params.get("toolCall") or {}
-    title = str(tool_call.get("title") or params.get("title") or "Tool action")
+    title = sanitize_terminal_text(str(tool_call.get("title") or params.get("title") or "Tool action"))
     options = [o for o in (params.get("options") or []) if isinstance(o, dict)]
     print(f"\n[acp permission] {title}", flush=True)
     for idx, opt in enumerate(options, 1):
-        name = opt.get("name") or opt.get("optionId") or opt.get("kind") or f"option-{idx}"
+        name = sanitize_terminal_text(
+            str(opt.get("name") or opt.get("optionId") or opt.get("kind") or f"option-{idx}")
+        )
         print(f"  {idx}. {name}", flush=True)
     if not options:
         return {"outcome": {"outcome": "cancelled"}}
@@ -232,12 +250,14 @@ class ACPClient:
         self.close()
 
     def _send(self, payload: dict[str, Any]) -> None:
-        assert self._proc is not None and self._proc.stdin is not None
+        if self._proc is None or self._proc.stdin is None:
+            raise RuntimeError("ACP subprocess is not running (stdin unavailable)")
         self._proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
         self._proc.stdin.flush()
 
     def _readline(self, deadline: float | None) -> str | None:
-        assert self._proc is not None and self._proc.stdout is not None
+        if self._proc is None or self._proc.stdout is None:
+            raise RuntimeError("ACP subprocess is not running (stdout unavailable)")
         stdout = self._proc.stdout
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -296,7 +316,7 @@ class ACPClient:
                 result = (
                     on_permission(srv_params)
                     if on_permission is not None
-                    else _pick_permission_option(srv_params, allow=True)
+                    else _auto_permission_handler(srv_params, allow=True)
                 )
                 self._send({"jsonrpc": "2.0", "id": msg["id"], "result": result})
             elif srv_method and "id" in msg:
@@ -452,7 +472,7 @@ def run_acp_headless_once(
     allow_perms = not read_only
 
     def perm_handler(params: dict[str, Any]) -> dict[str, Any]:
-        return _pick_permission_option(params, allow=allow_perms)
+        return _auto_permission_handler(params, allow=allow_perms)
 
     t0 = time.monotonic()
     client = ACPClient(acp_cmd, cwd=cwd)
@@ -532,7 +552,7 @@ def run_acp_interactive_session(
     perm_handler = (
         _interactive_permission_handler
         if is_interactive and sys.stdin.isatty()
-        else (lambda params: _pick_permission_option(params, allow=(effective_mode != "plan")))
+        else (lambda params: _auto_permission_handler(params, allow=(effective_mode != "plan")))
     )
 
     try:

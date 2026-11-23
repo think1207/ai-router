@@ -19,6 +19,7 @@ from ai_router.config import (
 )
 from ai_router.errors import AiRouteError
 from ai_router.models import DispatchEntry
+from ai_router.security import ensure_private_dir, ensure_private_file, sanitize_session_id
 from ai_router.tools import (
     build_tool_headless_argv,
     build_tool_shell_invocation,
@@ -123,9 +124,14 @@ def build_agent_shell_cmd(
 
 
 def session_log_path(session_id: str) -> Path:
-    """Return (and create the parent of) the output log path for a session."""
-    path = get_session_log_dir() / f"{session_id}.log"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Return (and create the parent of) the output log path for a session (path-confined)."""
+    safe_id = sanitize_session_id(session_id)
+    log_dir = get_session_log_dir()
+    ensure_private_dir(log_dir)
+    resolved_dir = log_dir.resolve()
+    path = (resolved_dir / f"{safe_id}.log").resolve()
+    if not path.is_relative_to(resolved_dir):
+        raise AiRouteError(f"Session log path escapes log directory: {session_id!r}")
     return path
 
 
@@ -134,6 +140,7 @@ def begin_session_log(session_id: str, tool: str, model: str) -> Path:
     path = session_log_path(session_id)
     with path.open("a", encoding="utf-8") as f:
         f.write(f"{RUN_START_LINE} {time.strftime('%Y-%m-%dT%H:%M:%S')} {tool}:{model}\n")
+    ensure_private_file(path)
     return path
 
 

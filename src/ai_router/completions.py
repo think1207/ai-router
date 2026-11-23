@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ai_router.config import VALID_EFFORTS, AppConfig, get_active_config
+from ai_router.security import validate_safe_identifier
 
 SUBCOMMANDS: tuple[str, ...] = (
     "run",
@@ -25,12 +26,23 @@ SUBCOMMANDS: tuple[str, ...] = (
 )
 
 
+def _is_safe(value: str) -> bool:
+    """Return True when `value` is a safe shell identifier (prevents completion injection)."""
+    try:
+        validate_safe_identifier(value, "identifier")
+        return True
+    except ValueError:
+        return False
+
+
 def generate_completions(shell: str, config: AppConfig | None = None) -> str:
     """Return a shell completion script for `bash`, `zsh`, or `fish`."""
     cfg = config or get_active_config()
     cmds = " ".join(SUBCOMMANDS)
-    tools = " ".join(cfg.available_tools)
-    presets = " ".join(sorted(cfg.presets.keys()))
+    safe_tools = [t for t in cfg.available_tools if _is_safe(t)]
+    safe_presets = [p for p in sorted(cfg.presets.keys()) if _is_safe(p)]
+    tools = " ".join(safe_tools)
+    presets = " ".join(safe_presets)
     efforts = " ".join(VALID_EFFORTS)
     common_flags = "-w --worktree --auto -p --plan --effort --tool --model --dry-run -f --file -F --task-file --config --help"
 
