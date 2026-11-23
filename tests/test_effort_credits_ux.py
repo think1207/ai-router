@@ -139,34 +139,35 @@ class TestEffortEstimation(unittest.TestCase):
             "claude --model opus --effort high -p",
             dispatch.build_agent_shell_cmd("claude", "opus", pf, "headless", effort="high"),
         )
-        self.assertIn(
-            "agy --model gemini-4-neon-high --effort max --prompt-interactive",
-            dispatch.build_agent_shell_cmd("agy", "gemini-4-neon-high", pf, "interactive", effort="max"),
-        )
-        self.assertIn(
-            "agy --model gemini-4-neon-high --effort medium -p",
-            dispatch.build_agent_shell_cmd("agy", "gemini-4-neon-high", pf, "headless", effort="medium"),
-        )
+        agy_i = dispatch.build_agent_shell_cmd("agy", "gemini-4-neon-high", pf, "interactive", effort="max")
+        self.assertIn("_acp-session --tool agy --model gemini-4-neon-high", agy_i)
+        self.assertIn("--effort xhigh", agy_i)
+        agy_h = dispatch.build_agent_shell_cmd("agy", "gemini-4-neon-high", pf, "headless", effort="medium")
+        self.assertIn("_acp-session --tool agy --model gemini-4-neon-high --mode headless", agy_h)
+        self.assertIn("--effort medium", agy_h)
         oc_cmd = dispatch.build_agent_shell_cmd(
             "opencode", "opencode-go/deepseek-v4.1-flash", pf, "headless", effort="high"
         )
         self.assertNotIn("--effort", oc_cmd)
 
-        # Headless command array
+        # Headless command array (non-ACP tools via run_cmd, agy via ACP runner)
         seen_cmds: list[list[str]] = []
 
         def fake_run(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
             seen_cmds.append(cmd)
             return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
 
-        with mock.patch.object(dispatch, "run_cmd", side_effect=fake_run):
+        with mock.patch.object(dispatch, "run_cmd", side_effect=fake_run), mock.patch.object(
+            dispatch, "run_acp_headless_once", return_value=(0, "ok", 5)
+        ) as m_acp:
             dispatch.run_agent_headless_once("claude", "sonnet", "hi", Path.cwd(), effort="high")
             dispatch.run_agent_headless_once("agy", "gemini-4-neon-high", "hi", Path.cwd(), effort="xhigh")
             dispatch.run_agent_headless_once("opencode", "opencode-go/deepseek-v4.1-flash", "hi", Path.cwd(), effort="high")
 
         self.assertEqual(seen_cmds[0], ["claude", "--model", "sonnet", "--effort", "high", "-p", "hi"])
-        self.assertEqual(seen_cmds[1], ["agy", "--model", "gemini-4-neon-high", "--effort", "xhigh", "-p", "hi"])
-        self.assertNotIn("--effort", seen_cmds[2])
+        m_acp.assert_called_once()
+        self.assertEqual(m_acp.call_args.kwargs["effort"], "xhigh")
+        self.assertNotIn("--effort", seen_cmds[1])
 
     def test_twostage_plan_extracts_implementer_effort(self) -> None:
         plan, valid = twostage.extract_plan(
@@ -444,7 +445,8 @@ class TestUsabilityAndResume(unittest.TestCase):
         self.assertEqual(len(dispatched), 1)
         self.assertEqual(dispatched[0]["tool"], "agy")
         self.assertIn("クレジットが切れた", dispatched[0]["prompt_text"])
-        self.assertIn("agy --model gemini-3.8-flash-medium --effort medium", dispatched[0]["shell_cmd"])
+        self.assertIn("_acp-session --tool agy --model gemini-3.8-flash-medium", dispatched[0]["shell_cmd"])
+        self.assertIn("--effort medium", dispatched[0]["shell_cmd"])
 
     def test_resume_auto_escalates_blocked_session_in_one_command(self) -> None:
         meta = sessions.build_session_meta(

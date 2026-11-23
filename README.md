@@ -1,12 +1,19 @@
 # ai-router (`ai-route`)
 
-A unified CLI that classifies coding task difficulty with a lightweight OpenCode model and orchestrates multiple AI coding agents (**opencode**, **agy**, **claude**) using `git worktree` and `tmux`.
+A unified CLI that classifies coding task difficulty & reasoning effort and orchestrates multiple AI coding agents (**opencode**, **agy (ACP)**, **claude**, **copilot**, **codex**) using `git worktree` and `tmux`.
+
+> **Documentation:** Full guides, configuration reference, and service/ACP specs are available in **English** ([`docs/en/`](docs/en/README.md)) and **日本語** ([`docs/`](docs/README.md)):
+> - Usage Guide: [English](docs/en/usage.md) | [日本語](docs/usage.md)
+> - Configuration Reference: [English](docs/en/configuration.md) | [日本語](docs/configuration.md)
+> - Services, ACP Mode & Credit Failover: [English](docs/en/services-and-failover.md) | [日本語](docs/services-and-failover.md)
 
 ## Features
 
-- **Minimal Everyday Commands (`ai-route "<task>"`, `resume`, `review`, `status`)**: Omit `run` for quick task execution, use `--auto` for one-flag synchronous headless execution, and use unified `resume` to automatically handle blocked escalations, credit failovers, or handoffs in a single command.
-- **Automatic Task Routing with Difficulty & Effort Estimation (`run`)**: Evaluates both task complexity (`difficulty`) and reasoning depth (`effort`: `low` / `medium` / `high` / `xhigh` / `max`), selects an appropriate `(tool, model)` pair, passes `--effort` to supporting CLIs (`claude`, `agy`), and optionally launches in an isolated `git worktree` and `tmux` window/pane.
+- **Minimal Everyday Commands (`ai-route "<task>"`, `resume`, `done`, `review`, `status`)**: Omit `run` for quick task execution, pipe tasks directly via stdin (`echo "..." | ai-route`), use `--auto` for one-flag synchronous headless execution, use unified `resume` to automatically handle blocked escalations / credit failovers / handoffs, and finish worktrees in one step with `ai-route done [--pr]`.
+- **Multi-Service Support & Mandatory `agy` ACP Mode**: Supports **opencode**, **agy** (always executed via Agent Client Protocol `agy acp --stdio` with default `auto` mode and `plan` mode for read-only stages), **claude**, **GitHub Copilot CLI (`copilot`)**, and **OpenAI Codex CLI (`codex`)**. Automatically detects installed CLIs on `PATH` and routes across available services even without `opencode`.
+- **Automatic Task Routing with Difficulty & Effort Estimation (`run`)**: Evaluates both task complexity (`difficulty`) and reasoning depth (`effort`: `low` / `medium` / `high` / `xhigh` / `max`), selects an appropriate `(tool, model)` pair, passes effort to supporting CLIs (`claude`, `agy` ACP `thought_level`, `copilot` `--reasoning-effort`, `codex` `model_reasoning_effort`), and optionally launches in an isolated `git worktree` and `tmux` window/pane.
 - **Automatic Credit-Exhaustion Failover**: Detects credit/quota/rate-limit errors from agents and the router, tracks per-service cooldowns (`provider_state.json`), automatically excludes exhausted services from routing, and seamlessly fails over to an alternative service during `--auto` / `--wait` or `resume`.
+- **Zero-Friction Setup (`init` / `doctor` / `--completions` / `[defaults]`)**: Generate a tailored `config.toml` with `ai-route init`, verify your environment with `ai-route doctor` (or `status --check`), set preferred CLI flag defaults in `[defaults]`, and enable `bash` / `zsh` / `fish` shell completions via `ai-route --completions <shell>`.
 - **In-Place Model Handoff (`handoff`)**: Transfers current worktree diffs and context to another model in a horizontal split pane while recording handoff lineage.
 - **Parallel Multi-Model Review (`review`)**: Runs multiple models concurrently over diffs or files in either `headless` (with optional synthesized summary) or `interactive` tiled tmux panes.
 - **Parallel Multi-Model Solve, Compare & Pick (`multi` / `compare` / `pick`)**: Spawns multiple models on isolated worktrees from a common base commit, compares commits, diff stats, and test outcomes side by side, and merges the winning branch while cleaning up the worktrees and `ai/` branches.
@@ -50,9 +57,9 @@ uv run python -m ai_router --help
 Most daily workflows only need **3–4 commands** (`run` can be omitted):
 
 ```bash
-# 1. Start a task (auto-estimates difficulty + effort, skips credit-exhausted services)
+# 1. Start a task (auto-estimates difficulty + effort, auto-detects installed CLIs, skips credit-exhausted services)
 ai-route "Fix edge cases in the CSV parser"
-ai-route -w "Add caching layer"                  # isolated git worktree
+echo "Add retry backoff" | ai-route -w           # piped stdin is auto-detected
 ai-route --auto "Add unit tests for parser"      # sync headless + auto-escalate + credit failover
 ai-route -p -w "Refactor authentication"         # two-stage planner -> implementer
 
@@ -60,10 +67,15 @@ ai-route -p -w "Refactor authentication"         # two-stage planner -> implemen
 ai-route resume                                  # auto-picks current worktree or latest session
 ai-route resume --auto                           # resume synchronously with failover & escalation
 
-# 3. Review & inspect status / credit cooldowns
+# 3. Finish a worktree task in one command (test -> merge or PR -> cleanup)
+ai-route done --test-cmd "pytest -q"             # merge to main & delete worktree/branch
+ai-route done --pr                               # push & open GitHub PR via `gh pr create`
+
+# 4. Review, setup, diagnostics & shell completions
 ai-route review --synthesize
-ai-route status
-ai-route status --reset-credits                  # clear cooldowns after refilling credits
+ai-route init                                    # generate config.toml for installed CLIs
+ai-route doctor                                  # alias: `ai-route status --check`
+eval "$(ai-route --completions zsh)"             # bash / zsh / fish tab completions
 ```
 
 ### 1. `run` (default command) — Route (difficulty + effort) and dispatch a task
@@ -205,6 +217,17 @@ ai-route clean ../my-repo-worktrees/fix-parser-1121-001000 --delete-branch
 ai-route stats --here --days 30
 ```
 
+## Antigravity (`agy`) ACP Mode & Compliance Notes
+
+`ai-router` invokes `agy` exclusively through the official Agent Client Protocol server (`agy acp --stdio`, defaulting to `auto` mode and `plan` mode for read-only stages) rather than scraping tokens or using unofficial wrappers.
+
+> [!IMPORTANT]
+> **Using ACP mode alone does not exempt consumer OAuth usage from Google Antigravity's Terms of Service (Section 6).**
+>
+> - **Avoid**: Reusing or proxying personal OAuth credentials (`oauth-personal`) inside unattended/high-volume automated loops, multi-account quota rotation, or third-party agent harnesses. Violations can result in suspension of Antigravity / Gemini CLI / Gemini Code Assist access.
+> - **Recommended for interactive use**: Run human-supervised interactive sessions (e.g., `ai-route "task"`, `ai-route -w "task"` in tmux).
+> - **Recommended for automated / headless workflows (`--auto`, `--wait`, `review`, `multi`)**: Authenticate via a **Google AI Studio API key (`gemini-api-key`)** or **Vertex AI (`agent-platform`)** instead of personal OAuth, or use the official [Antigravity Python SDK](https://github.com/google-antigravity/antigravity-sdk-python) (`google-antigravity`).
+
 ## Configuration & Custom Model Registry
 
 `ai-router` supports external user configuration via TOML to accommodate differing model access, custom endpoints, and subscription tiers across users.
@@ -230,8 +253,8 @@ If no configuration file is present, `ai-route` runs with complete backward comp
 ### Configuration Format (`config.toml` Example)
 
 ```toml
-# List of supported tool identifiers (default: ["opencode", "agy", "claude"])
-supported_tools = ["opencode", "agy", "claude"]
+# List of supported tool identifiers (default: ["opencode", "agy", "claude", "copilot", "codex"])
+supported_tools = ["opencode", "agy", "claude", "copilot", "codex"]
 
 # Add new candidate models or override existing candidates by (tool, model) pair
 [[candidates]]
@@ -283,10 +306,23 @@ reason = "Fallback due to router output parse error or disallowed model selectio
 
 # Runtime settings (overridable by environment variables or CLI flags)
 [runtime]
+router_tool = ""                                 # empty = auto (opencode, or first installed service)
+router_fallback_tools = ["opencode", "agy", "copilot", "claude"]
 router_model = "opencode-go/deepseek-v4.1-flash"
+agy_acp_mode = "auto"                            # agy always uses ACP (`agy acp --stdio`)
+copilot_permission_flag = "--allow-all-tools"
+auto_detect_tools = true                         # skip uninstalled CLIs during routing/failover
 router_timeout = 60.0
 review_timeout = 300.0
 test_cmd_timeout = 300.0
+
+# Optional CLI flag defaults so everyday commands require fewer flags
+[defaults]
+worktree = false
+auto = false
+split = false
+plan_first = true
+acp_mode = "auto"
 ```
 
 ## Built-in Models & Presets
@@ -348,6 +384,10 @@ Resolution order: CLI (`--planner` / `--implementer`) > `AI_ROUTE_PLANNER` / `AI
 | `AI_ROUTE_CREDIT_COOLDOWN_SEC` | `3600` | Cooldown in seconds before routing back to a service marked credit-exhausted |
 | `AI_ROUTE_CREDIT_PATTERNS` | *(empty)* | Extra regexes (separated by `;;`, case-insensitive) treated as credit/quota exhaustion |
 | `AI_ROUTE_PROVIDER_STATE_FILE` | `<log dir>/provider_state.json` | Path to the persisted credit-cooldown state file |
+| `AI_ROUTE_ROUTER_TOOL` | *(auto)* | Force a specific service (`opencode`/`agy`/`copilot`/`claude`/`codex`) for routing |
+| `AI_ROUTE_AGY_ACP_MODE` | `auto` | Default ACP mode for `agy` (`auto`/`accept-edits`/`default`/`plan`; read-only stages always use `plan`) |
+| `AI_ROUTE_COPILOT_PERMISSION_FLAG` | `--allow-all-tools` | Permission flag passed to `copilot` in headless mode |
+| `AI_ROUTE_AUTO_DETECT_TOOLS` | `true` | Automatically exclude uninstalled CLIs from routing & failover (`0`/`false` to disable) |
 
 ## History Events (`history.jsonl`)
 

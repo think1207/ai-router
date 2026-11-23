@@ -22,7 +22,7 @@ from ai_router.errors import ConfigError
 # Builtin Defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_SUPPORTED_TOOLS: tuple[str, ...] = ("opencode", "agy", "claude")
+DEFAULT_SUPPORTED_TOOLS: tuple[str, ...] = ("opencode", "agy", "claude", "copilot", "codex")
 
 DEFAULT_CANDIDATES: list[dict[str, str]] = [
     {
@@ -44,6 +44,12 @@ DEFAULT_CANDIDATES: list[dict[str, str]] = [
         "description": "複雑なロジック実装、精密なコード修正、デバッグ",
     },
     {
+        "tool": "copilot",
+        "model": "gpt-5.6-sol",
+        "difficulty": "medium",
+        "description": "中規模な実装、コード修正、GitHub連携開発（GitHub Copilot CLI）",
+    },
+    {
         "tool": "agy",
         "model": "gemini-4-neon-high",
         "difficulty": "high",
@@ -54,6 +60,12 @@ DEFAULT_CANDIDATES: list[dict[str, str]] = [
         "model": "opus",
         "difficulty": "high",
         "description": "高難度のアーキテクチャ設計、難解なバグ解析、広範囲の破壊的変更",
+    },
+    {
+        "tool": "codex",
+        "model": "gpt-6.1-sol",
+        "difficulty": "high",
+        "description": "高難度の設計・大規模実装・自律的なデバッグ（OpenAI Codex CLI）",
     },
 ]
 
@@ -84,16 +96,21 @@ DEFAULT_FALLBACK_DECISION: dict[str, str] = {
 }
 
 VALID_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+VALID_ACP_MODES: tuple[str, ...] = ("default", "accept-edits", "auto", "plan")
 DIFFICULTY_TO_DEFAULT_EFFORT: dict[str, str] = {
     "low": "low",
     "medium": "medium",
     "high": "high",
 }
 
+DEFAULT_ROUTER_TOOL: str = ""
 DEFAULT_ROUTER_MODEL: str = "opencode-go/deepseek-v4.1-flash"
 DEFAULT_OPENCODE_ATTACH_URL: str = ""
 DEFAULT_AGY_PASTE_FALLBACK: bool = False
 DEFAULT_AGY_PASTE_DELAY_SEC: float = 2.0
+DEFAULT_AGY_ACP_MODE: str = "auto"
+DEFAULT_COPILOT_PERMISSION_FLAG: str = "--allow-all-tools"
+DEFAULT_AUTO_DETECT_TOOLS: bool = True
 
 DEFAULT_ROUTER_TIMEOUT_SEC: float = 60.0
 DEFAULT_REVIEW_TIMEOUT_SEC: float = 300.0
@@ -300,8 +317,23 @@ def get_credit_patterns() -> list[re.Pattern[str]]:
 
 
 # ---------------------------------------------------------------------------
-# AppConfig Dataclass
+# AppConfig & DefaultsConfig Dataclasses
 # ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class DefaultsConfig:
+    """User-configurable CLI flag defaults (`[defaults]` section in config.toml)."""
+
+    worktree: bool = False
+    mode: str = "interactive"
+    auto: bool = False
+    split: bool = False
+    plan_first: bool = True
+    preset: str = ""
+    effort: str = ""
+    acp_mode: str = DEFAULT_AGY_ACP_MODE
+
 
 @dataclasses.dataclass
 class AppConfig:
@@ -318,15 +350,21 @@ class AppConfig:
     allowed_pairs: set[tuple[str, str]] = dataclasses.field(
         default_factory=lambda: {(c["tool"], c["model"]) for c in DEFAULT_CANDIDATES}
     )
+    router_tool: str = DEFAULT_ROUTER_TOOL
+    router_fallback_tools: tuple[str, ...] = ()
     router_model: str = DEFAULT_ROUTER_MODEL
     opencode_attach_url: str = DEFAULT_OPENCODE_ATTACH_URL
     agy_paste_fallback: bool = DEFAULT_AGY_PASTE_FALLBACK
     agy_paste_delay_sec: float = DEFAULT_AGY_PASTE_DELAY_SEC
+    agy_acp_mode: str = DEFAULT_AGY_ACP_MODE
+    copilot_permission_flag: str = DEFAULT_COPILOT_PERMISSION_FLAG
+    auto_detect_tools: bool = DEFAULT_AUTO_DETECT_TOOLS
     router_timeout_sec: float = DEFAULT_ROUTER_TIMEOUT_SEC
     review_timeout_sec: float = DEFAULT_REVIEW_TIMEOUT_SEC
     test_cmd_timeout_sec: float = DEFAULT_TEST_CMD_TIMEOUT_SEC
     agent_timeout_sec: float = DEFAULT_AGENT_TIMEOUT_SEC
     credit_cooldown_sec: float = DEFAULT_CREDIT_COOLDOWN_SEC
+    defaults: DefaultsConfig = dataclasses.field(default_factory=DefaultsConfig)
 
     @property
     def available_tools(self) -> tuple[str, ...]:
@@ -644,6 +682,29 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
     if not isinstance(raw_runtime, dict):
         raise ConfigError(f"'runtime' must be a table, got {type(raw_runtime).__name__}")
 
+    router_tool = str(
+        raw.get("router_tool")
+        or raw_runtime.get("router_tool")
+        or DEFAULT_ROUTER_TOOL
+    ).strip()
+    if router_tool and router_tool not in supported_tools:
+        raise ConfigError(
+            f"Unsupported router_tool {router_tool!r} (supported: {', '.join(supported_tools)})"
+        )
+
+    raw_router_fallbacks = raw.get("router_fallback_tools", raw_runtime.get("router_fallback_tools"))
+    if raw_router_fallbacks is not None:
+        if not isinstance(raw_router_fallbacks, (list, tuple)):
+            raise ConfigError("'router_fallback_tools' must be a list of tool names")
+        router_fallback_tools = tuple(str(t).strip() for t in raw_router_fallbacks if str(t).strip())
+        for t in router_fallback_tools:
+            if t not in supported_tools:
+                raise ConfigError(
+                    f"Unsupported tool {t!r} in router_fallback_tools (supported: {', '.join(supported_tools)})"
+                )
+    else:
+        router_fallback_tools = ()
+
     router_model = str(
         raw.get("router_model")
         or raw_runtime.get("router_model")
@@ -664,6 +725,27 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         raw.get("agy_delay", raw_runtime.get("agy_delay", DEFAULT_AGY_PASTE_DELAY_SEC))
     )
 
+    agy_acp_mode = str(
+        raw.get("agy_acp_mode")
+        or raw_runtime.get("agy_acp_mode")
+        or DEFAULT_AGY_ACP_MODE
+    ).strip().lower()
+    if agy_acp_mode not in VALID_ACP_MODES:
+        raise ConfigError(
+            f"Invalid agy_acp_mode {agy_acp_mode!r} (must be one of: {', '.join(VALID_ACP_MODES)})"
+        )
+
+    copilot_permission_flag = str(
+        raw.get(
+            "copilot_permission_flag",
+            raw_runtime.get("copilot_permission_flag", DEFAULT_COPILOT_PERMISSION_FLAG),
+        )
+    ).strip()
+
+    auto_detect_tools = bool(
+        raw.get("auto_detect_tools", raw_runtime.get("auto_detect_tools", DEFAULT_AUTO_DETECT_TOOLS))
+    )
+
     router_timeout = float(
         raw.get("router_timeout", raw_runtime.get("router_timeout", DEFAULT_ROUTER_TIMEOUT_SEC))
     )
@@ -680,21 +762,61 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         raw.get("credit_cooldown_sec", raw_runtime.get("credit_cooldown_sec", DEFAULT_CREDIT_COOLDOWN_SEC))
     )
 
+    # 7. CLI defaults (`[defaults]` section)
+    raw_defaults = raw.get("defaults", {})
+    if not isinstance(raw_defaults, dict):
+        raise ConfigError(f"'defaults' must be a table, got {type(raw_defaults).__name__}")
+    def_mode = str(raw_defaults.get("mode", "interactive")).strip().lower()
+    if def_mode not in {"interactive", "headless"}:
+        raise ConfigError(f"Invalid defaults.mode {def_mode!r} (must be 'interactive' or 'headless')")
+    def_effort = str(raw_defaults.get("effort", "")).strip().lower()
+    if def_effort and def_effort not in VALID_EFFORTS:
+        raise ConfigError(
+            f"Invalid defaults.effort {def_effort!r} (must be one of: {', '.join(VALID_EFFORTS)})"
+        )
+    def_acp_mode = str(raw_defaults.get("acp_mode", agy_acp_mode)).strip().lower()
+    if def_acp_mode not in VALID_ACP_MODES:
+        raise ConfigError(
+            f"Invalid defaults.acp_mode {def_acp_mode!r} (must be one of: {', '.join(VALID_ACP_MODES)})"
+        )
+    def_preset = str(raw_defaults.get("preset", "")).strip()
+    if def_preset and def_preset not in presets:
+        raise ConfigError(
+            f"Invalid defaults.preset {def_preset!r} (available: {', '.join(sorted(presets.keys()))})"
+        )
+
+    defaults_cfg = DefaultsConfig(
+        worktree=bool(raw_defaults.get("worktree", False)),
+        mode=def_mode,
+        auto=bool(raw_defaults.get("auto", False)),
+        split=bool(raw_defaults.get("split", False)),
+        plan_first=bool(raw_defaults.get("plan_first", True)),
+        preset=def_preset,
+        effort=def_effort,
+        acp_mode=def_acp_mode,
+    )
+
     cfg = AppConfig(
         supported_tools=supported_tools,
         candidates=candidates,
         presets=presets,
         fallback_decision=fallback_decision,
         allowed_pairs=allowed_pairs_set,
+        router_tool=router_tool,
+        router_fallback_tools=router_fallback_tools,
         router_model=router_model,
         opencode_attach_url=opencode_attach_url,
         agy_paste_fallback=agy_paste_fallback,
         agy_paste_delay_sec=agy_delay,
+        agy_acp_mode=def_acp_mode,
+        copilot_permission_flag=copilot_permission_flag,
+        auto_detect_tools=auto_detect_tools,
         router_timeout_sec=router_timeout,
         review_timeout_sec=review_timeout,
         test_cmd_timeout_sec=test_cmd_timeout,
         agent_timeout_sec=agent_timeout,
         credit_cooldown_sec=credit_cooldown,
+        defaults=defaults_cfg,
     )
 
     validate_config(cfg)
@@ -721,6 +843,13 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     cfg = load_config_from_dict(data)
 
     # Apply environment variable overrides (Environment variables > config file)
+    if "AI_ROUTE_ROUTER_TOOL" in os.environ:
+        rt = os.environ["AI_ROUTE_ROUTER_TOOL"].strip()
+        if rt and rt not in cfg.supported_tools:
+            raise ConfigError(
+                f"Unsupported AI_ROUTE_ROUTER_TOOL={rt!r} (supported: {', '.join(cfg.supported_tools)})"
+            )
+        cfg.router_tool = rt
     if "AI_ROUTE_ROUTER_MODEL" in os.environ:
         cfg.router_model = os.environ["AI_ROUTE_ROUTER_MODEL"]
     if "OPENCODE_ATTACH_URL" in os.environ:
@@ -732,6 +861,20 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             cfg.agy_paste_delay_sec = float(os.environ["AI_ROUTE_AGY_DELAY"])
         except ValueError:
             pass
+    if "AI_ROUTE_AGY_ACP_MODE" in os.environ:
+        acp_m = os.environ["AI_ROUTE_AGY_ACP_MODE"].strip().lower()
+        if acp_m in VALID_ACP_MODES:
+            cfg.agy_acp_mode = acp_m
+            cfg.defaults.acp_mode = acp_m
+    if "AI_ROUTE_COPILOT_PERMISSION_FLAG" in os.environ:
+        cfg.copilot_permission_flag = os.environ["AI_ROUTE_COPILOT_PERMISSION_FLAG"].strip()
+    if "AI_ROUTE_AUTO_DETECT_TOOLS" in os.environ:
+        cfg.auto_detect_tools = os.environ["AI_ROUTE_AUTO_DETECT_TOOLS"].strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
 
     return cfg
 

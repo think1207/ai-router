@@ -93,16 +93,10 @@ class TestDispatch(unittest.TestCase):
         cmd_agy_i = dispatch.build_agent_shell_cmd(
             "agy", "gemini-3.8-flash-medium", pf, "interactive", agy_paste_fallback=False
         )
-        self.assertIn("agy --model gemini-3.8-flash-medium --prompt-interactive", cmd_agy_i)
-
-        cmd_agy_paste = dispatch.build_agent_shell_cmd(
-            "agy", "gemini-3.8-flash-medium", pf, "interactive", agy_paste_fallback=True
-        )
-        self.assertNotIn("--prompt-interactive", cmd_agy_paste)
-        self.assertIn("agy --model gemini-3.8-flash-medium;", cmd_agy_paste)
+        self.assertIn("_acp-session --tool agy --model gemini-3.8-flash-medium --mode interactive --acp-mode auto", cmd_agy_i)
 
         cmd_agy_h = dispatch.build_agent_shell_cmd("agy", "gemini-4-neon-high", pf, "headless")
-        self.assertIn("agy --model gemini-4-neon-high -p", cmd_agy_h)
+        self.assertIn("_acp-session --tool agy --model gemini-4-neon-high --mode headless --acp-mode auto", cmd_agy_h)
 
         cmd_oc = dispatch.build_agent_shell_cmd(
             "opencode", "opencode-go/deepseek-v4.1-flash", pf, "interactive"

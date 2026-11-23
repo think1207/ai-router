@@ -113,6 +113,9 @@ def record_credit_exhausted(
     )
 
 
+_REAL_RUN_HEADLESS = run_agent_headless_once
+
+
 def _call_headless(
     tool: str,
     model: str,
@@ -121,11 +124,15 @@ def _call_headless(
     *,
     timeout: float | None,
     effort: str = "",
+    read_only: bool = False,
 ) -> tuple[int, str, int]:
-    """Invoke `run_agent_headless_once`, passing `effort` only when non-empty for mock compatibility."""
+    """Invoke `run_agent_headless_once`, passing optional kwargs safely for test-mock compatibility."""
+    kwargs: dict[str, Any] = {"timeout": timeout}
     if effort:
-        return run_agent_headless_once(tool, model, prompt, cwd, timeout=timeout, effort=effort)
-    return run_agent_headless_once(tool, model, prompt, cwd, timeout=timeout)
+        kwargs["effort"] = effort
+    if read_only and run_agent_headless_once is _REAL_RUN_HEADLESS:
+        kwargs["read_only"] = True
+    return run_agent_headless_once(tool, model, prompt, cwd, **kwargs)
 
 
 def run_and_record(
@@ -140,11 +147,15 @@ def run_and_record(
     stage: str = "single",
     save_meta: bool = True,
     effort: str = "",
+    read_only: bool | None = None,
 ) -> tuple[AgentRunResult, dict[str, Any]]:
     """Run an agent synchronously, detect credit exhaustion/blocking, and record events."""
     effort_tag = f", effort={effort}" if effort else ""
+    effective_read_only = (stage in {"planner", "escalate", "review"}) if read_only is None else read_only
     print(f"[running] {tool}:{model} (stage={stage}{effort_tag}, timeout={f'{timeout:g}s' if timeout else 'none'})")
-    rc, output, latency_ms = _call_headless(tool, model, prompt, workdir, timeout=timeout, effort=effort)
+    rc, output, latency_ms = _call_headless(
+        tool, model, prompt, workdir, timeout=timeout, effort=effort, read_only=effective_read_only
+    )
     credit_reason = detect_credit_exhausted(rc, output)
     signal = None if credit_reason else detect_blocked(rc, output)
     status = classify_status(rc, signal, credit_reason=credit_reason)
@@ -238,7 +249,7 @@ def escalate_session(
     while True:
         print(f"[escalating] {session_id} -> {cur_tool}:{cur_model} (trigger={trigger})")
         rc, output, latency_ms = _call_headless(
-            cur_tool, cur_model, prompt, workdir, timeout=timeout, effort=effort
+            cur_tool, cur_model, prompt, workdir, timeout=timeout, effort=effort, read_only=True
         )
         credit_reason = detect_credit_exhausted(rc, output)
         if credit_reason:

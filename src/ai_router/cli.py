@@ -7,16 +7,21 @@ import shlex
 import subprocess
 import sys
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from typing import NoReturn, Sequence
 
+from ai_router.acp import run_acp_interactive_session
 from ai_router.commands.multi import cmd_compare, cmd_multi, cmd_pick
 from ai_router.commands.review import cmd_review
 from ai_router.commands.run import cmd_handoff, cmd_run
 from ai_router.commands.session import cmd_escalate, cmd_resume, cmd_status
+from ai_router.commands.setup import cmd_doctor, cmd_init
 from ai_router.commands.stats import cmd_stats
-from ai_router.commands.worktree import cmd_clean, cmd_list
+from ai_router.commands.worktree import cmd_clean, cmd_done, cmd_list
+from ai_router.completions import generate_completions
 from ai_router.config import (
     STAGE_PRESETS,
+    VALID_ACP_MODES,
     VALID_EFFORTS,
     AppConfig,
     get_active_config,
@@ -24,6 +29,7 @@ from ai_router.config import (
     set_active_config,
 )
 from ai_router.errors import AiRouteError, ConfigError
+from ai_router.tools import get_tool_adapter
 
 KNOWN_COMMANDS: frozenset[str] = frozenset(
     {
@@ -35,21 +41,43 @@ KNOWN_COMMANDS: frozenset[str] = frozenset(
         "review",
         "escalate",
         "status",
+        "done",
+        "init",
+        "doctor",
         "multi",
         "compare",
         "pick",
         "list",
         "clean",
         "stats",
+        "_acp-session",
     }
 )
+
+
+def _cmd_acp_session(args: argparse.Namespace) -> None:
+    """Internal entrypoint used by tmux panes to run an ACP-backed agent (e.g. `agy`)."""
+    adapter = get_tool_adapter(args.tool)
+    if adapter is None or not adapter.acp_args:
+        raise AiRouteError(f"Tool '{args.tool}' does not have an ACP command configured.")
+    rc = run_acp_interactive_session(
+        acp_cmd=adapter.acp_cmd(),
+        model=args.model,
+        prompt_file=Path(args.prompt_file),
+        mode=args.mode,
+        effort=args.effort or "",
+        acp_mode=args.acp_mode or "auto",
+        resume_session_id=args.resume_session_id or "",
+    )
+    if rc != 0:
+        sys.exit(rc)
 
 
 def normalize_argv(raw_argv: Sequence[str]) -> list[str]:
     """Allow omitting `run` for quick invocations (e.g. `ai-route "Fix bug"`, `ai-route -w "Add X"`).
 
     Skips leading global `--config <path>` options. If the first remaining token is not a
-    known subcommand and not a global help/version flag, inserts `"run"` automatically.
+    known subcommand and not a global help/version/completions flag, inserts `"run"` automatically.
     """
     argv = list(raw_argv)
     idx = 0
@@ -67,7 +95,11 @@ def normalize_argv(raw_argv: Sequence[str]) -> list[str]:
         return argv
 
     first = argv[idx]
-    if first in KNOWN_COMMANDS or first in {"-h", "--help", "-V", "--version"}:
+    if (
+        first in KNOWN_COMMANDS
+        or first in {"-h", "--help", "-V", "--version", "--completions"}
+        or first.startswith("--completions=")
+    ):
         return argv
 
     return [*argv[:idx], "run", *argv[idx:]]
@@ -86,14 +118,17 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
     tools_choices = list(cfg.available_tools)
     preset_choices = list(cfg.presets.keys())
     default_tool = "claude" if "claude" in tools_choices else tools_choices[0]
-    default_preset = "balanced" if "balanced" in preset_choices else preset_choices[0]
+    if cfg.defaults.preset and cfg.defaults.preset in preset_choices:
+        default_preset = cfg.defaults.preset
+    else:
+        default_preset = "balanced" if "balanced" in preset_choices else preset_choices[0]
 
     parser = argparse.ArgumentParser(
         prog="ai-route",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "AI coding agent router and orchestrator with tmux, git worktree, "
-            "effort estimation, credit failover, and JSONL analytics."
+            "effort estimation, credit failover, ACP (`agy`), multi-service support, and JSONL analytics."
         ),
         epilog=(
             "Everyday commands (the `run` subcommand can be omitted):\n"
@@ -102,14 +137,22 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
             "  ai-route --auto \"Add tests\"        Run headless synchronously with auto-escalate & failover\n"
             "  ai-route -p \"Refactor auth\"        Two-stage: strong planner -> implementer\n"
             "  ai-route resume [SESSION_ID]       Smart continue (auto-escalate / credit failover / handoff)\n"
+            "  ai-route done [--pr]               Test, merge or open PR, and clean up worktree\n"
             "  ai-route review --synthesize       Multi-model code review\n"
-            "  ai-route status                    Check sessions & credit cooldowns\n"
+            "  ai-route status [--check]          Check sessions, credit cooldowns, and environment\n"
+            "  ai-route init                      Generate config.toml tailored to installed CLIs\n"
         ),
     )
     parser.add_argument(
         "--config",
         metavar="PATH",
         help="Path to custom TOML configuration file (overrides $AI_ROUTE_CONFIG)",
+    )
+    parser.add_argument(
+        "--completions",
+        choices=["bash", "zsh", "fish"],
+        default=None,
+        help="Print shell completion script for bash, zsh, or fish and exit",
     )
     parser.add_argument(
         "-V",
@@ -120,12 +163,12 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # run
-    p_run = sub.add_parser("run", help="Classify task difficulty and dispatch an agent")
+    p_run = sub.add_parser("run", help="Classify task difficulty & effort and dispatch an agent")
     p_run.add_argument(
         "task",
         nargs="?",
         default=None,
-        help="Task or problem description (optional or supplemental when -F is used)",
+        help="Task or problem description (optional or supplemental when -F or piped stdin is used)",
     )
     p_run.add_argument(
         "-f",
@@ -143,8 +186,16 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
     p_run.add_argument(
         "-w",
         "--worktree",
+        dest="worktree",
         action="store_true",
+        default=cfg.defaults.worktree,
         help="Create a new isolated git worktree for execution",
+    )
+    p_run.add_argument(
+        "--no-worktree",
+        dest="worktree",
+        action="store_false",
+        help="Run in the current directory (overrides defaults.worktree)",
     )
     p_run.add_argument(
         "--base",
@@ -155,17 +206,19 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
     p_run.add_argument(
         "--mode",
         choices=["interactive", "headless"],
-        default="interactive",
-        help="Execution mode (default: interactive)",
+        default=cfg.defaults.mode,
+        help=f"Execution mode (default: {cfg.defaults.mode})",
     )
     p_run.add_argument(
         "--split",
         action="store_true",
+        default=cfg.defaults.split,
         help="Launch in a split pane of the current tmux window instead of a new window",
     )
     p_run.add_argument(
         "--no-plan-first",
         action="store_true",
+        default=not cfg.defaults.plan_first,
         help="Do not append the plan-agreement-first instruction",
     )
     p_run.add_argument(
@@ -201,6 +254,7 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
     p_run.add_argument(
         "--auto",
         action="store_true",
+        default=cfg.defaults.auto,
         help="Shortcut for `--mode headless --wait` (sync run with auto-escalation & credit failover)",
     )
     p_run.add_argument(
@@ -583,6 +637,11 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
         metavar="TOOL",
         help="Manually mark a tool/service as credit-exhausted so routing skips it",
     )
+    p_status.add_argument(
+        "--check",
+        action="store_true",
+        help="Run environment and configuration diagnostics (alias for `ai-route doctor`)",
+    )
     p_status.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     p_status.set_defaults(func=cmd_status)
 
@@ -746,6 +805,93 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
     )
     p_cl.set_defaults(func=cmd_clean)
 
+    # done (one-command finish for a worktree: test, merge or PR, cleanup)
+    p_done = sub.add_parser(
+        "done",
+        help="Finish a worktree task: run optional tests, merge or create PR, and clean up",
+    )
+    p_done.add_argument(
+        "path",
+        nargs="?",
+        default="",
+        help="Path to the worktree (defaults to current worktree, or the sole active `ai/` worktree)",
+    )
+    p_done.add_argument(
+        "--test-cmd",
+        default="",
+        help="Verification command to run before merging or opening a PR (e.g. 'pytest -q')",
+    )
+    p_done.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Timeout for --test-cmd (default: $AI_ROUTE_TEST_CMD_TIMEOUT or 300; <=0 disables)",
+    )
+    p_done.add_argument(
+        "--pr",
+        action="store_true",
+        help="Push the branch and open a GitHub pull request via `gh pr create` instead of local merge",
+    )
+    p_done.add_argument("--title", default="", help="PR title when using --pr (default: --fill)")
+    p_done.add_argument("--draft", action="store_true", help="Create a draft PR when using --pr")
+    done_merge_group = p_done.add_mutually_exclusive_group()
+    done_merge_group.add_argument(
+        "--squash",
+        action="store_true",
+        help="Squash-merge into the main worktree instead of a regular merge",
+    )
+    done_merge_group.add_argument(
+        "--no-ff",
+        action="store_true",
+        help="Create a merge commit (`git merge --no-ff`)",
+    )
+    p_done.add_argument(
+        "--keep",
+        action="store_true",
+        help="Keep the worktree and branch after merging",
+    )
+    p_done.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Allow proceeding with uncommitted changes and force-remove worktree/branch",
+    )
+    p_done.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview merge/PR and cleanup commands without modifying git state",
+    )
+    p_done.set_defaults(func=cmd_done)
+
+    # init
+    p_init = sub.add_parser(
+        "init",
+        help="Detect installed agent CLIs and generate ~/.config/ai-route/config.toml",
+    )
+    p_init.add_argument("-o", "--output", default="", help="Output path (default: ~/.config/ai-route/config.toml)")
+    p_init.add_argument("-f", "--force", action="store_true", help="Overwrite an existing configuration file")
+    p_init.add_argument("--dry-run", action="store_true", help="Print generated config without writing")
+    p_init.set_defaults(func=cmd_init)
+
+    # doctor
+    p_doc = sub.add_parser(
+        "doctor",
+        help="Inspect installed agent CLIs, active config, router service, and credit cooldowns",
+    )
+    p_doc.set_defaults(func=cmd_doctor)
+
+    # internal ACP session bridge (omitting `help` hides it from subcommand listing)
+    p_acp = sub.add_parser("_acp-session")
+    p_acp.add_argument("--tool", required=True)
+    p_acp.add_argument("--model", required=True)
+    p_acp.add_argument("--prompt-file", required=True)
+    p_acp.add_argument("--mode", choices=["interactive", "headless"], default="interactive")
+    p_acp.add_argument("--effort", default="")
+    p_acp.add_argument("--acp-mode", choices=list(VALID_ACP_MODES), default="auto")
+    p_acp.add_argument("--resume-session-id", default="")
+    p_acp.set_defaults(func=_cmd_acp_session)
+
     # stats
     p_st = sub.add_parser(
         "stats",
@@ -808,6 +954,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         set_active_config(cfg)
     except ConfigError as e:
         _fail(str(e))
+
+    # Handle --completions before subcommand parsing
+    for i, arg in enumerate(raw_argv):
+        if arg == "--completions" and i + 1 < len(raw_argv):
+            shell_name = raw_argv[i + 1]
+            try:
+                print(generate_completions(shell_name, cfg), end="")
+            except ValueError as e:
+                _fail(str(e))
+            return
+        elif arg.startswith("--completions="):
+            shell_name = arg.split("=", 1)[1]
+            try:
+                print(generate_completions(shell_name, cfg), end="")
+            except ValueError as e:
+                _fail(str(e))
+            return
 
     parser = build_parser(cfg)
     args = parser.parse_args(normalize_argv(raw_argv))

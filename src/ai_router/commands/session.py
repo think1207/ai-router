@@ -155,6 +155,12 @@ def _status_targets(args: argparse.Namespace, cwd: Path) -> list[tuple[Path, dic
 
 def cmd_status(args: argparse.Namespace) -> None:
     """Show session status, credit cooldown state, and detect blocked/exhausted agents."""
+    if getattr(args, "check", False):
+        from ai_router.commands.setup import run_diagnostics
+
+        run_diagnostics()
+        return
+
     reset_target = getattr(args, "reset_credits", None)
     if reset_target is not None:
         tool_to_clear = None if reset_target == "__all__" else reset_target

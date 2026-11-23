@@ -43,6 +43,18 @@ from ai_router.utils import (
 )
 
 
+_REAL_RUN_HEADLESS = run_agent_headless_once
+
+
+def _run_review_model(
+    tool: str, model: str, prompt: str, cwd: Path, *, timeout: float | None
+) -> tuple[int, str, int]:
+    """Run a review/synthesis model in read-only (ACP `plan`) mode when using the real runner."""
+    if run_agent_headless_once is _REAL_RUN_HEADLESS:
+        return run_agent_headless_once(tool, model, prompt, cwd, timeout=timeout, read_only=True)
+    return run_agent_headless_once(tool, model, prompt, cwd, timeout=timeout)
+
+
 def collect_review_target(args: argparse.Namespace, cwd: Path, repo_root: Path | None) -> str:
     """Gather specified files and/or git diff output as the review target payload."""
     sections: list[str] = []
@@ -155,7 +167,7 @@ def cmd_review(args: argparse.Namespace) -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(specs)) as ex:
         fut_map = {
             ex.submit(
-                run_agent_headless_once, tool, model, build_review_prompt(idx), cwd, timeout=timeout
+                _run_review_model, tool, model, build_review_prompt(idx), cwd, timeout=timeout
             ): (idx, tool, model)
             for idx, (tool, model) in enumerate(specs)
         }
@@ -222,7 +234,7 @@ def cmd_review(args: argparse.Namespace) -> None:
                 )
             print(f"  [synthesizing with {syn_tool}:{syn_model}...]")
             try:
-                syn_rc, syn_out, syn_lat = run_agent_headless_once(
+                syn_rc, syn_out, syn_lat = _run_review_model(
                     syn_tool, syn_model, syn_prompt, cwd, timeout=timeout
                 )
             except Exception as e:  # noqa: BLE001 - individual reviews must still be saved
