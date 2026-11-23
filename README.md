@@ -212,6 +212,17 @@ ai-route clean ../my-repo-worktrees/fix-parser-1121-001000 --delete-branch
 ai-route stats --here --days 30
 ```
 
+## Antigravity (`agy`) ACP Mode & Compliance Notes
+
+`ai-router` invokes `agy` exclusively through the official Agent Client Protocol server (`agy acp --stdio`, defaulting to `auto` mode and `plan` mode for read-only stages) rather than scraping tokens or using unofficial wrappers.
+
+> [!IMPORTANT]
+> **Using ACP mode alone does not exempt consumer OAuth usage from Google Antigravity's Terms of Service (Section 6).**
+>
+> - **Avoid**: Reusing or proxying personal OAuth credentials (`oauth-personal`) inside unattended/high-volume automated loops, multi-account quota rotation, or third-party agent harnesses. Violations can result in suspension of Antigravity / Gemini CLI / Gemini Code Assist access.
+> - **Recommended for interactive use**: Run human-supervised interactive sessions (e.g., `ai-route "task"`, `ai-route -w "task"` in tmux).
+> - **Recommended for automated / headless workflows (`--auto`, `--wait`, `review`, `multi`)**: Authenticate via a **Google AI Studio API key (`gemini-api-key`)** or **Vertex AI (`agent-platform`)** instead of personal OAuth, or use the official [Antigravity Python SDK](https://github.com/google-antigravity/antigravity-sdk-python) (`google-antigravity`).
+
 ## Configuration & Custom Model Registry
 
 `ai-router` supports external user configuration via TOML to accommodate differing model access, custom endpoints, and subscription tiers across users.
@@ -237,8 +248,8 @@ If no configuration file is present, `ai-route` runs with complete backward comp
 ### Configuration Format (`config.toml` Example)
 
 ```toml
-# List of supported tool identifiers (default: ["opencode", "agy", "claude"])
-supported_tools = ["opencode", "agy", "claude"]
+# List of supported tool identifiers (default: ["opencode", "agy", "claude", "copilot", "codex"])
+supported_tools = ["opencode", "agy", "claude", "copilot", "codex"]
 
 # Add new candidate models or override existing candidates by (tool, model) pair
 [[candidates]]
