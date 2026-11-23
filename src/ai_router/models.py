@@ -16,6 +16,7 @@ class RouteDecision:
     branch_slug: str
     reason: str
     refined_prompt: str
+    effort: str = ""  # "" | "low" | "medium" | "high" | "xhigh" | "max"
     router_latency_ms: int = 0
     is_fallback: bool = False
     stage: str = "single"  # "single" | "planner" | "implementer"

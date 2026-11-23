@@ -12,9 +12,12 @@ from typing import Any
 
 from ai_router.config import (
     CANDIDATES,
+    DIFFICULTY_TO_DEFAULT_EFFORT,
     FALLBACK_DECISION,
     OUTPUT_SUMMARY_CHARS,
     SUPPORTED_TOOLS,
+    VALID_EFFORTS,
+    get_active_config,
     resolve_implementer_spec,
     resolve_planner_spec,
 )
@@ -30,7 +33,8 @@ PLAN_JSON_SCHEMA = """{
   "constraints": ["<実装時に守るべき制約>", "..."],
   "open_questions": ["<まだ判断できない点（なければ空配列）>"],
   "implementation_steps": ["<実装手順（順序付き）>", "..."],
-  "implementer_difficulty": "low" | "medium" | "high"
+  "implementer_difficulty": "low" | "medium" | "high",
+  "implementer_effort": "low" | "medium" | "high" | "xhigh" | "max"
 }"""
 
 _JUDGE_ONLY_RULES = (
@@ -45,6 +49,7 @@ def default_plan(raw_output: str = "") -> dict[str, Any]:
     """Safe fallback plan used when the planner output is missing or invalid."""
     plan: dict[str, Any] = {key: [] for key in PLAN_LIST_KEYS}
     plan["implementer_difficulty"] = DEFAULT_IMPLEMENTER_DIFFICULTY
+    plan["implementer_effort"] = DIFFICULTY_TO_DEFAULT_EFFORT[DEFAULT_IMPLEMENTER_DIFFICULTY]
     raw = (raw_output or "").strip()
     if raw:
         plan["raw_notes"] = raw[-OUTPUT_SUMMARY_CHARS * 2 :]
@@ -87,6 +92,10 @@ def validate_plan(obj: Any) -> dict[str, Any] | None:
         return None
     diff = str(obj.get("implementer_difficulty", "")).strip().lower()
     plan["implementer_difficulty"] = diff if diff in DIFFICULTY_ORDER else DEFAULT_IMPLEMENTER_DIFFICULTY
+    eff = str(obj.get("implementer_effort", "")).strip().lower()
+    plan["implementer_effort"] = (
+        eff if eff in VALID_EFFORTS else DIFFICULTY_TO_DEFAULT_EFFORT[plan["implementer_difficulty"]]
+    )
     return plan
 
 
@@ -219,25 +228,38 @@ def build_resume_prompt(base_prompt: str, plan: dict[str, Any]) -> str:
     )
 
 
-def select_candidate(difficulty: str, tool: str | None = None) -> tuple[str, str]:
-    """Pick `(tool, model)` from CANDIDATES for a difficulty, optionally restricted to a tool.
+def select_candidate(
+    difficulty: str,
+    tool: str | None = None,
+    *,
+    excluded_tools: set[str] | None = None,
+) -> tuple[str, str]:
+    """Pick `(tool, model)` from active candidates for a difficulty, optionally restricted to a tool.
 
-    Exact difficulty matches win (first in CANDIDATES order); otherwise the nearest
-    difficulty is used, preferring the stronger side on ties. Falls back to
-    FALLBACK_DECISION when no candidate exists for the tool.
+    Exact difficulty matches win (first in candidates order); otherwise the nearest
+    difficulty is used, preferring the stronger side on ties. Excludes tools in
+    `excluded_tools` when alternatives exist. Falls back to fallback_decision when no
+    candidate exists for the tool.
     """
-    pool = [c for c in CANDIDATES if tool is None or c["tool"] == tool]
+    cfg = get_active_config()
+    excluded = excluded_tools or set()
+    pool = [
+        c for c in cfg.candidates
+        if (tool is None or c["tool"] == tool) and c["tool"] not in excluded
+    ]
+    if not pool and excluded:
+        pool = [c for c in cfg.candidates if tool is None or c["tool"] == tool]
     if not pool:
-        if tool is not None and tool not in SUPPORTED_TOOLS:
-            raise AiRouteError(f"Unsupported tool '{tool}' (supported: {', '.join(SUPPORTED_TOOLS)})")
-        return FALLBACK_DECISION["tool"], FALLBACK_DECISION["model"]
+        if tool is not None and tool not in cfg.supported_tools:
+            raise AiRouteError(f"Unsupported tool '{tool}' (supported: {', '.join(cfg.supported_tools)})")
+        return cfg.fallback_decision["tool"], cfg.fallback_decision["model"]
     target = DIFFICULTY_ORDER.index(difficulty) if difficulty in DIFFICULTY_ORDER else 1
 
     def rank(c: dict[str, str]) -> tuple[int, int]:
         level = DIFFICULTY_ORDER.index(c["difficulty"]) if c["difficulty"] in DIFFICULTY_ORDER else 1
         return abs(level - target), 0 if level >= target else 1
 
-    best = min(pool, key=rank)  # min() is stable, so CANDIDATES order breaks ties
+    best = min(pool, key=rank)  # min() is stable, so candidates order breaks ties
     return best["tool"], best["model"]
 
 

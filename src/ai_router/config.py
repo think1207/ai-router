@@ -76,10 +76,18 @@ DEFAULT_MODEL_PRESETS: dict[str, list[tuple[str, str]]] = {
 
 DEFAULT_FALLBACK_DECISION: dict[str, str] = {
     "difficulty": "medium",
+    "effort": "medium",
     "tool": "claude",
     "model": "sonnet",
     "branch_slug": "ai-task",
     "reason": "Fallback due to router output parse error or disallowed model selection",
+}
+
+VALID_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+DIFFICULTY_TO_DEFAULT_EFFORT: dict[str, str] = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
 }
 
 DEFAULT_ROUTER_MODEL: str = "opencode-go/deepseek-v4.1-flash"
@@ -91,11 +99,14 @@ DEFAULT_ROUTER_TIMEOUT_SEC: float = 60.0
 DEFAULT_REVIEW_TIMEOUT_SEC: float = 300.0
 DEFAULT_TEST_CMD_TIMEOUT_SEC: float = 300.0
 DEFAULT_AGENT_TIMEOUT_SEC: float = 1800.0
+DEFAULT_CREDIT_COOLDOWN_SEC: float = 3600.0
 
 ROUTER_TIMEOUT_ENV = "AI_ROUTE_ROUTER_TIMEOUT"
 REVIEW_TIMEOUT_ENV = "AI_ROUTE_REVIEW_TIMEOUT"
 TEST_CMD_TIMEOUT_ENV = "AI_ROUTE_TEST_CMD_TIMEOUT"
 AGENT_TIMEOUT_ENV = "AI_ROUTE_AGENT_TIMEOUT"
+CREDIT_COOLDOWN_ENV = "AI_ROUTE_CREDIT_COOLDOWN_SEC"
+CREDIT_PATTERNS_ENV = "AI_ROUTE_CREDIT_PATTERNS"
 
 PLAN_FIRST_INSTRUCTION: str = (
     "※まずは考えられる解決アプローチと実装順序の案を提示し、合意を得てから編集に着手してください。"
@@ -229,6 +240,66 @@ def get_blocked_patterns() -> list[re.Pattern[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Credit / quota exhaustion detection patterns
+# ---------------------------------------------------------------------------
+
+# High-confidence patterns checked even when exit code is unknown (e.g. tmux log)
+STRONG_CREDIT_PATTERNS: tuple[str, ...] = (
+    r"credit balance is too low",
+    r"out of credits?",
+    r"insufficient[_ ]credits?",
+    r"no credits? remaining",
+    r"credits? exhausted",
+    r"insufficient[_ ]quota",
+    r"exceeded your current quota",
+    r"usage limit reached",
+    r"hit your (usage |plan |rate )?limit",
+    r"spending limit (reached|exceeded)",
+    r"billing (hard )?limit",
+    r"クレジット.{0,6}(不足|切れ|上限|残高)",
+    r"クォータ.{0,6}(超過|上限)",
+    r"利用上限に達",
+)
+
+# Broader patterns checked when the CLI exited with a non-zero return code
+DEFAULT_CREDIT_PATTERNS: tuple[str, ...] = (
+    *STRONG_CREDIT_PATTERNS,
+    r"quota[_ ]exceeded",
+    r"resource[_ ]exhausted",
+    r"rate[_ ]limit(?:ed| exceeded)?",
+    r"too many requests",
+    r"\bhttp\s*429\b|\bstatus[: ]+429\b|\berror\s*429\b",
+    r"monthly limit (reached|exceeded)",
+    r"plan limit (reached|exceeded)",
+    r"account.{0,20}billing",
+    r"overloaded_error",
+)
+
+
+def _compile_patterns(raw_patterns: list[str], label: str) -> list[re.Pattern[str]]:
+    compiled: list[re.Pattern[str]] = []
+    for pat in raw_patterns:
+        try:
+            compiled.append(re.compile(pat, re.IGNORECASE))
+        except re.error as e:
+            print(f"[warn] Ignoring invalid {label} pattern {pat!r}: {e}", file=sys.stderr)
+    return compiled
+
+
+def get_strong_credit_patterns() -> list[re.Pattern[str]]:
+    """Return high-confidence regex patterns for credit exhaustion."""
+    return _compile_patterns(list(STRONG_CREDIT_PATTERNS), "credit")
+
+
+def get_credit_patterns() -> list[re.Pattern[str]]:
+    """Return credit/quota exhaustion regex patterns plus $AI_ROUTE_CREDIT_PATTERNS."""
+    raw = list(DEFAULT_CREDIT_PATTERNS)
+    extra = os.environ.get(CREDIT_PATTERNS_ENV, "")
+    raw.extend(p.strip() for p in extra.split(";;") if p.strip())
+    return _compile_patterns(raw, "credit")
+
+
+# ---------------------------------------------------------------------------
 # AppConfig Dataclass
 # ---------------------------------------------------------------------------
 
@@ -255,6 +326,7 @@ class AppConfig:
     review_timeout_sec: float = DEFAULT_REVIEW_TIMEOUT_SEC
     test_cmd_timeout_sec: float = DEFAULT_TEST_CMD_TIMEOUT_SEC
     agent_timeout_sec: float = DEFAULT_AGENT_TIMEOUT_SEC
+    credit_cooldown_sec: float = DEFAULT_CREDIT_COOLDOWN_SEC
 
     @property
     def available_tools(self) -> tuple[str, ...]:
@@ -327,6 +399,12 @@ def validate_config(cfg: AppConfig) -> None:
                 f"Candidate #{idx + 1} ({tool}:{model}) has invalid difficulty {diff!r} "
                 f"(must be one of: {', '.join(sorted(VALID_DIFFICULTIES))})"
             )
+        cand_effort = str(c.get("effort", "")).strip().lower()
+        if cand_effort and cand_effort not in VALID_EFFORTS:
+            raise ConfigError(
+                f"Candidate #{idx + 1} ({tool}:{model}) has invalid effort {cand_effort!r} "
+                f"(must be one of: {', '.join(VALID_EFFORTS)})"
+            )
         pair = (tool, model)
         if pair in seen_pairs:
             raise ConfigError(f"Duplicate candidate model: {tool}:{model}")
@@ -339,6 +417,7 @@ def validate_config(cfg: AppConfig) -> None:
     fb_tool = str(cfg.fallback_decision.get("tool", "")).strip()
     fb_model = str(cfg.fallback_decision.get("model", "")).strip()
     fb_diff = str(cfg.fallback_decision.get("difficulty", "medium")).strip().lower()
+    fb_effort = str(cfg.fallback_decision.get("effort", "")).strip().lower()
 
     if not fb_tool or fb_tool not in cfg.supported_tools:
         raise ConfigError(
@@ -348,6 +427,11 @@ def validate_config(cfg: AppConfig) -> None:
         raise ConfigError("FALLBACK_DECISION has an empty model")
     if fb_diff not in VALID_DIFFICULTIES:
         raise ConfigError(f"FALLBACK_DECISION has invalid difficulty {fb_diff!r}")
+    if fb_effort and fb_effort not in VALID_EFFORTS:
+        raise ConfigError(
+            f"FALLBACK_DECISION has invalid effort {fb_effort!r} "
+            f"(must be one of: {', '.join(VALID_EFFORTS)})"
+        )
     if (fb_tool, fb_model) not in cfg.allowed_pairs:
         raise ConfigError(
             f"FALLBACK_DECISION ({fb_tool}:{fb_model}) is not among the allowed candidates: "
@@ -455,12 +539,21 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
                 raise ConfigError(f"Duplicate candidate in configuration: {tool}:{model}")
             seen_in_config.add(pair)
 
-            candidates_map[pair] = {
+            entry: dict[str, str] = {
                 "tool": tool,
                 "model": model,
                 "difficulty": diff,
                 "description": desc,
             }
+            if "effort" in item and item["effort"] is not None:
+                cand_effort = str(item["effort"]).strip().lower()
+                if cand_effort not in VALID_EFFORTS:
+                    raise ConfigError(
+                        f"Candidate #{idx + 1} ({tool}:{model}) has invalid effort {cand_effort!r} "
+                        f"(must be one of: {', '.join(VALID_EFFORTS)})"
+                    )
+                entry["effort"] = cand_effort
+            candidates_map[pair] = entry
 
     # Remove candidates
     raw_removals = raw.get("remove_candidates")
@@ -504,6 +597,8 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
             fallback_decision["model"] = str(raw_fallback["model"]).strip()
         if "difficulty" in raw_fallback:
             fallback_decision["difficulty"] = str(raw_fallback["difficulty"]).strip().lower()
+        if "effort" in raw_fallback:
+            fallback_decision["effort"] = str(raw_fallback["effort"]).strip().lower()
         if "branch_slug" in raw_fallback:
             fallback_decision["branch_slug"] = str(raw_fallback["branch_slug"]).strip()
         if "reason" in raw_fallback:
@@ -515,6 +610,9 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
             fallback_decision["tool"] = first_c["tool"]
             fallback_decision["model"] = first_c["model"]
             fallback_decision["difficulty"] = first_c["difficulty"]
+            fallback_decision["effort"] = first_c.get(
+                "effort", DIFFICULTY_TO_DEFAULT_EFFORT.get(first_c["difficulty"], "medium")
+            )
 
     # 5. Presets
     presets: dict[str, list[tuple[str, str]]] = {}
@@ -578,6 +676,9 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
     agent_timeout = float(
         raw.get("agent_timeout", raw_runtime.get("agent_timeout", DEFAULT_AGENT_TIMEOUT_SEC))
     )
+    credit_cooldown = float(
+        raw.get("credit_cooldown_sec", raw_runtime.get("credit_cooldown_sec", DEFAULT_CREDIT_COOLDOWN_SEC))
+    )
 
     cfg = AppConfig(
         supported_tools=supported_tools,
@@ -593,6 +694,7 @@ def load_config_from_dict(raw: dict[str, Any]) -> AppConfig:
         review_timeout_sec=review_timeout,
         test_cmd_timeout_sec=test_cmd_timeout,
         agent_timeout_sec=agent_timeout,
+        credit_cooldown_sec=credit_cooldown,
     )
 
     validate_config(cfg)
@@ -739,3 +841,28 @@ def get_log_file() -> Path:
 def get_session_log_dir() -> Path:
     """Directory holding per-session agent output logs (tee / tmux pipe-pane)."""
     return get_log_file().parent / "sessions"
+
+
+def get_provider_state_file() -> Path:
+    """Return the path to the provider credit/cooldown state JSON file."""
+    override = os.environ.get("AI_ROUTE_PROVIDER_STATE_FILE")
+    if override:
+        return Path(override).expanduser()
+    return get_log_file().parent / "provider_state.json"
+
+
+def get_credit_cooldown_sec() -> float:
+    """Effective cooldown duration in seconds for a credit-exhausted service."""
+    raw = os.environ.get(CREDIT_COOLDOWN_ENV, "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val >= 0:
+                return val
+        except ValueError:
+            print(
+                f"[warn] Ignoring invalid {CREDIT_COOLDOWN_ENV}={raw!r}; "
+                f"using default {_ACTIVE_CONFIG.credit_cooldown_sec:g}s.",
+                file=sys.stderr,
+            )
+    return _ACTIVE_CONFIG.credit_cooldown_sec

@@ -68,12 +68,20 @@ EXIT_LINE_PREFIX = "[ai-route] exit="
 RUN_START_LINE = "[ai-route] run-start"
 
 
-def _agent_invocation(tool: str, model: str, pf: str, mode: str, agy_paste_fallback: bool) -> str:
+def _agent_invocation(
+    tool: str,
+    model: str,
+    pf: str,
+    mode: str,
+    agy_paste_fallback: bool,
+    effort: str = "",
+) -> str:
     m = shlex.quote(model)
+    effort_flag = f"--effort {shlex.quote(effort)} " if effort else ""
     if tool == "claude":
         if mode == "headless":
-            return f'claude --model {m} -p "$(cat {pf})"'
-        return f'claude --model {m} "$(cat {pf})"'
+            return f'claude --model {m} {effort_flag}-p "$(cat {pf})"'
+        return f'claude --model {m} {effort_flag}"$(cat {pf})"'
 
     if tool == "opencode":
         attach_flag = f"--attach {shlex.quote(OPENCODE_ATTACH_URL)} " if OPENCODE_ATTACH_URL else ""
@@ -83,10 +91,10 @@ def _agent_invocation(tool: str, model: str, pf: str, mode: str, agy_paste_fallb
 
     if tool == "agy":
         if mode == "headless":
-            return f'agy --model {m} -p "$(cat {pf})"'
+            return f'agy --model {m} {effort_flag}-p "$(cat {pf})"'
         if agy_paste_fallback:
-            return f"agy --model {m}"
-        return f'agy --model {m} --prompt-interactive "$(cat {pf})"'
+            return f"agy --model {m}" + (f" --effort {shlex.quote(effort)}" if effort else "")
+        return f'agy --model {m} {effort_flag}--prompt-interactive "$(cat {pf})"'
 
     raise ValueError(f"Unsupported tool: {tool}")
 
@@ -99,6 +107,7 @@ def build_agent_shell_cmd(
     *,
     agy_paste_fallback: bool = AGY_PASTE_FALLBACK,
     log_path: Path | None = None,
+    effort: str = "",
 ) -> str:
     """Build the shell command string executed inside a tmux pane or current shell.
 
@@ -108,7 +117,7 @@ def build_agent_shell_cmd(
     TUI would break its TTY). Without ``log_path`` the command is unchanged.
     """
     pf = shlex.quote(str(prompt_file))
-    invocation = _agent_invocation(tool, model, pf, mode, agy_paste_fallback)
+    invocation = _agent_invocation(tool, model, pf, mode, agy_paste_fallback, effort=effort)
     tail = f'rm -f {pf}; exec "$SHELL"'
     if log_path is None:
         return f"{invocation}; {tail}"
@@ -163,6 +172,7 @@ def run_agent_headless_once(
     cwd: Path,
     *,
     timeout: float | None = None,
+    effort: str = "",
 ) -> tuple[int, str, int]:
     """Run a single agent non-interactively and return `(returncode, output, latency_ms)`.
 
@@ -171,9 +181,15 @@ def run_agent_headless_once(
     reason included in ``output``.
     """
     if tool == "claude":
-        cmd = ["claude", "--model", model, "-p", prompt]
+        cmd = ["claude", "--model", model]
+        if effort:
+            cmd.extend(["--effort", effort])
+        cmd.extend(["-p", prompt])
     elif tool == "agy":
-        cmd = ["agy", "--model", model, "-p", prompt]
+        cmd = ["agy", "--model", model]
+        if effort:
+            cmd.extend(["--effort", effort])
+        cmd.extend(["-p", prompt])
     elif tool == "opencode":
         cmd = ["opencode", "run"]
         if OPENCODE_ATTACH_URL:

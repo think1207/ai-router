@@ -4,13 +4,15 @@ A unified CLI that classifies coding task difficulty with a lightweight OpenCode
 
 ## Features
 
-- **Automatic Task Routing (`run`)**: Evaluates task complexity and selects an appropriate `(tool, model)` pair, optionally creating an isolated `git worktree` and launching in a dedicated `tmux` window or split pane.
+- **Minimal Everyday Commands (`ai-route "<task>"`, `resume`, `review`, `status`)**: Omit `run` for quick task execution, use `--auto` for one-flag synchronous headless execution, and use unified `resume` to automatically handle blocked escalations, credit failovers, or handoffs in a single command.
+- **Automatic Task Routing with Difficulty & Effort Estimation (`run`)**: Evaluates both task complexity (`difficulty`) and reasoning depth (`effort`: `low` / `medium` / `high` / `xhigh` / `max`), selects an appropriate `(tool, model)` pair, passes `--effort` to supporting CLIs (`claude`, `agy`), and optionally launches in an isolated `git worktree` and `tmux` window/pane.
+- **Automatic Credit-Exhaustion Failover**: Detects credit/quota/rate-limit errors from agents and the router, tracks per-service cooldowns (`provider_state.json`), automatically excludes exhausted services from routing, and seamlessly fails over to an alternative service during `--auto` / `--wait` or `resume`.
 - **In-Place Model Handoff (`handoff`)**: Transfers current worktree diffs and context to another model in a horizontal split pane while recording handoff lineage.
 - **Parallel Multi-Model Review (`review`)**: Runs multiple models concurrently over diffs or files in either `headless` (with optional synthesized summary) or `interactive` tiled tmux panes.
 - **Parallel Multi-Model Solve, Compare & Pick (`multi` / `compare` / `pick`)**: Spawns multiple models on isolated worktrees from a common base commit, compares commits, diff stats, and test outcomes side by side, and merges the winning branch while cleaning up the worktrees and `ai/` branches.
-- **Blocked Detection & Escalation (`run --wait` / `status` / `escalate`)**: Detects agents that stopped waiting for a human decision (explicit marker, question-like output, or exit code), escalates the decision to a stronger model without letting it edit files, and resumes the implementer with the decision.
-- **Decision / Implementation Split (`run --two-stage`, `review --then-implement`)**: A strong planner fixes decisions and steps as JSON; a cheaper implementer executes them.
-- **Analytics & Worktree Lifecycle (`stats` / `list` / `clean`)**: Logs every routing, handoff, review, and multi-solve event to a locked JSONL file and provides summary analytics and worktree cleanup.
+- **Blocked Detection & Escalation (`--auto` / `run --wait` / `status` / `escalate` / `resume`)**: Detects agents that stopped waiting for a human decision (explicit marker, question-like output, or exit code), escalates the decision to a stronger model without letting it edit files, and resumes the implementer with the decision.
+- **Decision / Implementation Split (`-p` / `run --two-stage`, `review --then-implement`)**: A strong planner fixes decisions, steps, difficulty, and effort as JSON; a cheaper implementer executes them.
+- **Analytics & Worktree Lifecycle (`stats` / `list` / `clean`)**: Logs every routing, handoff, review, failover, and multi-solve event to a locked JSONL file and provides summary analytics and worktree cleanup.
 
 ## Prerequisites
 
@@ -45,35 +47,70 @@ uv run python -m ai_router --help
 
 ## Quick Start & Commands
 
-### 1. `run` — Route and dispatch a single task
+Most daily workflows only need **3–4 commands** (`run` can be omitted):
 
 ```bash
-# Auto-route and run in a new isolated git worktree
+# 1. Start a task (auto-estimates difficulty + effort, skips credit-exhausted services)
+ai-route "Fix edge cases in the CSV parser"
+ai-route -w "Add caching layer"                  # isolated git worktree
+ai-route --auto "Add unit tests for parser"      # sync headless + auto-escalate + credit failover
+ai-route -p -w "Refactor authentication"         # two-stage planner -> implementer
+
+# 2. Continue a stopped / blocked / credit-exhausted session in one command
+ai-route resume                                  # auto-picks current worktree or latest session
+ai-route resume --auto                           # resume synchronously with failover & escalation
+
+# 3. Review & inspect status / credit cooldowns
+ai-route review --synthesize
+ai-route status
+ai-route status --reset-credits                  # clear cooldowns after refilling credits
+```
+
+### 1. `run` (default command) — Route (difficulty + effort) and dispatch a task
+
+```bash
+# Auto-route and run in a new isolated git worktree (`run` is optional)
+ai-route -w "Fix edge cases in the CSV parser"
 ai-route run -w "Fix edge cases in the CSV parser"
 
-# Pass target/reference files and read the task from a file (or '-' for stdin)
-ai-route run -w -f src/parser.py -F task.md
+# Override estimated reasoning effort (low|medium|high|xhigh|max)
+ai-route --effort xhigh -w "Debug subtle race condition in worker pool"
 
-# Preview the routing decision and refined prompt without launching
-ai-route run --dry-run -f src/parser.py "Add streaming support"
+# Pass target/reference files and read the task from a file (or '-' for stdin)
+ai-route -w -f src/parser.py -F task.md
+
+# Preview the routing decision (difficulty, effort, model) and refined prompt without launching
+ai-route --dry-run -f src/parser.py "Add streaming support"
 
 # Skip automatic routing and force a specific tool/model
-ai-route run --tool agy --model gemini-4-neon-high -w "Refactor authentication middleware"
+ai-route --tool agy --model gemini-4-neon-high -w "Refactor authentication middleware"
 
-# Run headless *synchronously* in the current shell and detect blocking.
-# A blocked agent is escalated automatically (claude:opus, decision only) and resumed once.
-ai-route run --mode headless --wait "Add pagination to /users"
+# Run headless *synchronously* in the current shell with auto-escalation & credit failover.
+ai-route --auto "Add pagination to /users"       # shortcut for `run --mode headless --wait`
 ai-route run --mode headless --wait --no-auto-escalate --agent-timeout 900 "..."
 
-# Two-stage: planner (decisions only, no edits) -> implementer chosen by planned difficulty
-ai-route run --two-stage -w "Introduce a caching layer for the API client"
-ai-route run --two-stage --plan-preset cheap --mode headless --wait "Add CSV export"
+# Two-stage: planner (decisions only, no edits) -> implementer chosen by planned difficulty & effort
+ai-route -p -w "Introduce a caching layer for the API client"
+ai-route run --two-stage --plan-preset cheap --auto "Add CSV export"
 ai-route run --two-stage --planner claude:opus --implementer agy "..."   # bare tool = model by difficulty
 ```
 
 The default (`tmux`) behavior is unchanged; in addition, every launched agent's output is
 logged to `<log dir>/sessions/<session_id>.log` (headless: `tee`, interactive: `tmux pipe-pane`)
-so `ai-route status` can detect blocking afterwards.
+so `ai-route status` and `ai-route resume` can detect blocking and credit exhaustion afterwards.
+
+### 1b. `resume` (`continue` / `next`) — One-command smart continuation
+
+```bash
+# Inspect the current worktree's (or latest) session and take the appropriate next action:
+# - credit_exhausted -> automatically switches to an alternative service and continues
+# - blocked          -> automatically escalates for a decision and resumes implementation
+# - decided          -> resumes implementation with the saved decision
+# - failed / timeout -> continues with diff and output context
+ai-route resume
+ai-route resume 1a2b3c4d --auto
+ai-route resume -m "Prefer backwards compatibility" --tool agy
+```
 
 ### 2. `handoff` — Escalate or transfer an active worktree to another model
 
@@ -308,6 +345,9 @@ Resolution order: CLI (`--planner` / `--implementer`) > `AI_ROUTE_PLANNER` / `AI
 | `AI_ROUTE_BLOCKED_PATTERNS` | *(empty)* | Extra regexes (separated by `;;`, case-insensitive) treated as "waiting for a decision" in output tails |
 | `AI_ROUTE_PLANNER` | *(empty)* | Planner `tool:model` for `run --two-stage` (overrides presets) |
 | `AI_ROUTE_IMPLEMENTER` | *(empty)* | Implementer `tool:model` or bare tool for `--two-stage` / `--then-implement` |
+| `AI_ROUTE_CREDIT_COOLDOWN_SEC` | `3600` | Cooldown in seconds before routing back to a service marked credit-exhausted |
+| `AI_ROUTE_CREDIT_PATTERNS` | *(empty)* | Extra regexes (separated by `;;`, case-insensitive) treated as credit/quota exhaustion |
+| `AI_ROUTE_PROVIDER_STATE_FILE` | `<log dir>/provider_state.json` | Path to the persisted credit-cooldown state file |
 
 ## History Events (`history.jsonl`)
 
