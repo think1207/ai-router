@@ -2,6 +2,11 @@
 
 A unified CLI that classifies coding task difficulty & reasoning effort and orchestrates multiple AI coding agents (**opencode**, **agy (ACP)**, **claude**, **copilot**, **codex**) using `git worktree` and `tmux`.
 
+> **詳細なドキュメント:** 詳しい使い方・設定リファレンス・各サービス仕様は [`docs/`](docs/README.md) を参照してください。
+> - [使い方ガイド (`docs/usage.md`)](docs/usage.md)
+> - [設定リファレンス (`docs/configuration.md`)](docs/configuration.md)
+> - [対応サービス・ACP・クレジット切れフェイルオーバー (`docs/services-and-failover.md`)](docs/services-and-failover.md)
+
 ## Features
 
 - **Minimal Everyday Commands (`ai-route "<task>"`, `resume`, `done`, `review`, `status`)**: Omit `run` for quick task execution, pipe tasks directly via stdin (`echo "..." | ai-route`), use `--auto` for one-flag synchronous headless execution, use unified `resume` to automatically handle blocked escalations / credit failovers / handoffs, and finish worktrees in one step with `ai-route done [--pr]`.
