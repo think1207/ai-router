@@ -73,8 +73,12 @@ class _FlowHarness(unittest.TestCase):
     def agent(self, outputs: list[tuple[int, str]]) -> Callable[..., tuple[int, str, int]]:
         queue = list(outputs)
 
-        def fake(tool: str, model: str, prompt: str, cwd: Path, *, timeout: float | None = None):
-            self.calls.append({"tool": tool, "model": model, "prompt": prompt, "cwd": cwd, "timeout": timeout})
+        def fake(
+            tool: str, model: str, prompt: str, cwd: Path, *, timeout: float | None = None, effort: str = ""
+        ):
+            self.calls.append(
+                {"tool": tool, "model": model, "prompt": prompt, "cwd": cwd, "timeout": timeout, "effort": effort}
+            )
             rc, out = queue.pop(0)
             return rc, out, 7
 

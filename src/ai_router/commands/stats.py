@@ -50,8 +50,10 @@ def cmd_stats(args: argparse.Namespace) -> None:
     escalations = [e for e in events if e.get("event") == "escalated"]
     two_stages = [e for e in events if e.get("event") == "two_stage"]
     agent_results = [e for e in events if e.get("event") == "agent_result"]
+    credit_exhausted = [e for e in events if e.get("event") == "credit_exhausted"]
+    failovers = [e for e in events if e.get("event") == "failover"]
 
-    if not any((routes, handoffs, reviews, multis, picks, blocks, escalations, two_stages, agent_results)):
+    if not any((routes, handoffs, reviews, multis, picks, blocks, escalations, two_stages, agent_results, credit_exhausted, failovers)):
         print("No log entries match the specified filters.")
         return
 
@@ -62,6 +64,7 @@ def cmd_stats(args: argparse.Namespace) -> None:
     model_counts: collections.Counter[str] = collections.Counter()
     model_handoff_sessions: collections.Counter[str] = collections.Counter()
     diff_counts: collections.Counter[str] = collections.Counter()
+    effort_counts: collections.Counter[str] = collections.Counter()
     latencies: list[int] = []
     fallback_count = 0
 
@@ -69,6 +72,8 @@ def cmd_stats(args: argparse.Namespace) -> None:
         key = f'{r.get("tool")} ({r.get("model")})'
         model_counts[key] += 1
         diff_counts[str(r.get("difficulty", "unknown"))] += 1
+        if r.get("effort"):
+            effort_counts[str(r.get("effort"))] += 1
         if r.get("is_fallback"):
             fallback_count += 1
         if isinstance(r.get("router_latency_ms"), int) and r["router_latency_ms"] > 0:
@@ -109,6 +114,8 @@ def cmd_stats(args: argparse.Namespace) -> None:
             f"escalated {block_summary['escalated']} (auto {block_summary['escalated_auto']}) / "
             f"two-stage {block_summary['two_stage']}"
         )
+    if credit_exhausted or failovers:
+        print(f"Credit failovers   : exhausted {len(credit_exhausted)} / failovers {len(failovers)}")
 
     if total_routes > 0:
         print("\n--- Initial Routing Breakdown by Model ---")
@@ -123,6 +130,12 @@ def cmd_stats(args: argparse.Namespace) -> None:
         for d in ("low", "medium", "high", "manual"):
             if diff_counts[d]:
                 print(f"  {d:<8}: {diff_counts[d]}")
+
+        if effort_counts:
+            print("\n--- Breakdown by Effort ---")
+            for ef in ("low", "medium", "high", "xhigh", "max"):
+                if effort_counts[ef]:
+                    print(f"  {ef:<8}: {effort_counts[ef]}")
 
     if transitions:
         print("\n--- Handoff Transition Patterns ---")

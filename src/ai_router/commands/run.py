@@ -10,11 +10,16 @@ from typing import Any
 
 from ai_router.commands.session import refresh_session_from_log
 from ai_router.config import (
+    DIFFICULTY_TO_DEFAULT_EFFORT,
     ROUTER_MODEL,
     get_active_config,
     get_agent_timeout,
     get_router_timeout,
     resolve_implementer_spec,
+)
+from ai_router.credits import (
+    get_exhausted_tools,
+    select_alternative_candidate,
 )
 from ai_router.dispatch import resolve_workdir
 from ai_router.errors import AiRouteError
@@ -52,6 +57,9 @@ from ai_router.worktree import create_worktree
 
 def cmd_run(args: argparse.Namespace) -> None:
     """Classify a task and dispatch it to the selected coding agent."""
+    if getattr(args, "auto", False):
+        args.mode = "headless"
+        args.wait = True
     if getattr(args, "wait", False) and args.mode != "headless":
         raise AiRouteError("--wait requires --mode headless.")
     if getattr(args, "two_stage", False):
@@ -68,6 +76,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     use_plan_first = plan_first_enabled(args.no_plan_first, args.mode)
 
     cfg = get_active_config()
+    cli_effort = str(getattr(args, "effort", "") or "").strip().lower()
     if args.tool and args.model:
         if (args.tool, args.model) not in cfg.allowed_pairs:
             raise AiRouteError(
@@ -76,6 +85,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             )
         decision = RouteDecision(
             difficulty="manual",
+            effort=cli_effort,
             tool=args.tool,
             model=args.model,
             branch_slug=sanitize_slug(args.slug or "manual-task"),
@@ -91,6 +101,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             timeout=get_router_timeout(args.router_timeout),
             config=cfg,
         )
+        if cli_effort:
+            decision.effort = cli_effort
 
     agent_files_block = format_files_for_agent(resolved_files, using_worktree=bool(args.worktree))
     if agent_files_block:
@@ -98,6 +110,8 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     print("========================================")
     print(f" Difficulty : {decision.difficulty}")
+    if decision.effort:
+        print(f" Effort     : {decision.effort}")
     print(f" Selected   : {decision.tool} ({decision.model})")
     print(f" Reason     : {decision.reason}")
     if resolved_files:
@@ -162,6 +176,7 @@ def _start_session(
         stage=decision.stage,
         parent_session=decision.parent_session,
         mode=args.mode,
+        effort=decision.effort,
         **(extra_meta or {}),
     )
     save_session_meta(workdir, meta)
@@ -177,6 +192,7 @@ def _start_session(
             "tool": decision.tool,
             "model": decision.model,
             "difficulty": decision.difficulty,
+            "effort": decision.effort,
             "mode": args.mode,
             "worktree": bool(args.worktree),
             "router_model": router_model,
@@ -202,10 +218,13 @@ def _start_session(
         meta=meta,
         timeout=get_agent_timeout(getattr(args, "agent_timeout", None)),
         auto_escalate=bool(getattr(args, "auto_escalate", True)),
+        auto_failover=bool(getattr(args, "auto_failover", True)),
         stage=decision.stage,
         split=bool(getattr(args, "split", False)),
         win_name=f"{decision.tool}-{decision.branch_slug[:14]}",
         pane_title=f"{decision.tool}:{decision.model[:18]}",
+        effort=decision.effort,
+        difficulty=decision.difficulty if decision.difficulty in {"low", "medium", "high"} else "medium",
     )
 
 
@@ -236,12 +255,29 @@ def _cmd_run_two_stage(args: argparse.Namespace) -> None:
         return
 
     timeout = get_agent_timeout(args.agent_timeout)
+    auto_failover = bool(getattr(args, "auto_failover", True))
     planner_session = uuid.uuid4().hex[:8]
     planner_cwd = repo_root or Path.cwd()
-    result, _ = run_and_record(
-        tool=planner_tool, model=planner_model, prompt=planner_prompt, workdir=planner_cwd,
-        session_id=planner_session, meta=None, timeout=timeout, stage="planner", save_meta=False,
-    )
+    tried_planner_tools: set[str] = set()
+    while True:
+        result, _ = run_and_record(
+            tool=planner_tool, model=planner_model, prompt=planner_prompt, workdir=planner_cwd,
+            session_id=planner_session, meta=None, timeout=timeout, stage="planner", save_meta=False,
+        )
+        if result.status == "credit_exhausted" and auto_failover:
+            tried_planner_tools.add(planner_tool)
+            excluded = tried_planner_tools | set(get_exhausted_tools().keys())
+            alt = select_alternative_candidate("high", excluded_tools=excluded)
+            if alt is not None:
+                alt_tool, alt_model, _ = alt
+                print(
+                    f"[failover] Planner {planner_tool}:{planner_model} credit exhausted "
+                    f"({result.credit_exhausted_reason}); retrying planner with {alt_tool}:{alt_model}.",
+                    file=sys.stderr,
+                )
+                planner_tool, planner_model = alt_tool, alt_model
+                continue
+        break
     repo_name, branch_name = get_repo_and_branch(planner_cwd)
     two_stage_event: dict[str, Any] = {
         "ts": now_iso(),
@@ -267,8 +303,19 @@ def _cmd_run_two_stage(args: argparse.Namespace) -> None:
     if not valid:
         print("[warn] Planner output was not a valid plan JSON; using safe defaults with raw notes.", file=sys.stderr)
     impl_tool, impl_model = resolve_implementer(plan["implementer_difficulty"], args.implementer, args.plan_preset)
+    exhausted_now = set(get_exhausted_tools().keys())
+    if impl_tool in exhausted_now and auto_failover and not args.implementer:
+        alt_impl = select_alternative_candidate(plan["implementer_difficulty"], excluded_tools=exhausted_now)
+        if alt_impl is not None:
+            impl_tool, impl_model, _ = alt_impl
+    cli_effort = str(getattr(args, "effort", "") or "").strip().lower()
+    impl_effort = cli_effort or str(
+        plan.get("implementer_effort")
+        or DIFFICULTY_TO_DEFAULT_EFFORT.get(plan["implementer_difficulty"], "")
+    )
     print("\n" + format_plan_sections(plan))
-    print(f"\n Implementer: {impl_tool} ({impl_model}) [difficulty={plan['implementer_difficulty']}]")
+    effort_note = f", effort={impl_effort}" if impl_effort else ""
+    print(f"\n Implementer: {impl_tool} ({impl_model}) [difficulty={plan['implementer_difficulty']}{effort_note}]")
 
     workdir = _prepare_workdir(args, repo_root, sanitize_slug(args.slug or "two-stage"))
     agent_files = format_files_for_agent(resolved_files, using_worktree=bool(args.worktree))
@@ -276,6 +323,7 @@ def _cmd_run_two_stage(args: argparse.Namespace) -> None:
     impl_prompt = append_plan_first(impl_prompt, plan_first_enabled(args.no_plan_first, args.mode))
     decision = RouteDecision(
         difficulty=plan["implementer_difficulty"],
+        effort=impl_effort,
         tool=impl_tool,
         model=impl_model,
         branch_slug=sanitize_slug(args.slug or "two-stage"),

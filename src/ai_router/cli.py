@@ -12,17 +12,65 @@ from typing import NoReturn, Sequence
 from ai_router.commands.multi import cmd_compare, cmd_multi, cmd_pick
 from ai_router.commands.review import cmd_review
 from ai_router.commands.run import cmd_handoff, cmd_run
-from ai_router.commands.session import cmd_escalate, cmd_status
+from ai_router.commands.session import cmd_escalate, cmd_resume, cmd_status
 from ai_router.commands.stats import cmd_stats
 from ai_router.commands.worktree import cmd_clean, cmd_list
 from ai_router.config import (
     STAGE_PRESETS,
+    VALID_EFFORTS,
     AppConfig,
     get_active_config,
     load_config,
     set_active_config,
 )
 from ai_router.errors import AiRouteError, ConfigError
+
+KNOWN_COMMANDS: frozenset[str] = frozenset(
+    {
+        "run",
+        "resume",
+        "continue",
+        "next",
+        "handoff",
+        "review",
+        "escalate",
+        "status",
+        "multi",
+        "compare",
+        "pick",
+        "list",
+        "clean",
+        "stats",
+    }
+)
+
+
+def normalize_argv(raw_argv: Sequence[str]) -> list[str]:
+    """Allow omitting `run` for quick invocations (e.g. `ai-route "Fix bug"`, `ai-route -w "Add X"`).
+
+    Skips leading global `--config <path>` options. If the first remaining token is not a
+    known subcommand and not a global help/version flag, inserts `"run"` automatically.
+    """
+    argv = list(raw_argv)
+    idx = 0
+    while idx < len(argv):
+        tok = argv[idx]
+        if tok == "--config":
+            idx += 2
+            continue
+        if tok.startswith("--config="):
+            idx += 1
+            continue
+        break
+
+    if idx >= len(argv):
+        return argv
+
+    first = argv[idx]
+    if first in KNOWN_COMMANDS or first in {"-h", "--help", "-V", "--version"}:
+        return argv
+
+    return [*argv[:idx], "run", *argv[idx:]]
 
 
 def _get_version() -> str:
@@ -42,9 +90,20 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="ai-route",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "AI coding agent router and orchestrator with tmux, git worktree, "
-            "handoff, multi-model review/solve, and JSONL analytics."
+            "effort estimation, credit failover, and JSONL analytics."
+        ),
+        epilog=(
+            "Everyday commands (the `run` subcommand can be omitted):\n"
+            "  ai-route \"Fix parser bug\"          Auto-route (difficulty + effort) and launch\n"
+            "  ai-route -w \"Add feature\"          Auto-route in a new git worktree\n"
+            "  ai-route --auto \"Add tests\"        Run headless synchronously with auto-escalate & failover\n"
+            "  ai-route -p \"Refactor auth\"        Two-stage: strong planner -> implementer\n"
+            "  ai-route resume [SESSION_ID]       Smart continue (auto-escalate / credit failover / handoff)\n"
+            "  ai-route review --synthesize       Multi-model code review\n"
+            "  ai-route status                    Check sessions & credit cooldowns\n"
         ),
     )
     parser.add_argument(
@@ -119,6 +178,12 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
         help="Force a specific model (must be combined with --tool)",
     )
     p_run.add_argument(
+        "--effort",
+        choices=list(VALID_EFFORTS),
+        default=None,
+        help="Override reasoning effort level (low|medium|high|xhigh|max; default: estimated by router)",
+    )
+    p_run.add_argument(
         "--dry-run",
         action="store_true",
         help="Print routing decision and refined prompt without launching",
@@ -134,6 +199,11 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
         ),
     )
     p_run.add_argument(
+        "--auto",
+        action="store_true",
+        help="Shortcut for `--mode headless --wait` (sync run with auto-escalation & credit failover)",
+    )
+    p_run.add_argument(
         "--wait",
         action="store_true",
         help="With --mode headless, run synchronously and detect blocked (waiting-for-decision) output",
@@ -142,7 +212,13 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
         "--auto-escalate",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="With --wait, escalate a blocked agent to a stronger model and resume once (default: on)",
+        help="With --wait/--auto, escalate a blocked agent to a stronger model and resume once (default: on)",
+    )
+    p_run.add_argument(
+        "--auto-failover",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically route/retry on an alternative service when credits are exhausted (default: on)",
     )
     p_run.add_argument(
         "--agent-timeout",
@@ -155,7 +231,10 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
         ),
     )
     p_run.add_argument(
+        "-p",
+        "--plan",
         "--two-stage",
+        dest="two_stage",
         action="store_true",
         help="Plan with a strong model (decisions only, no edits), then implement with another; skips the router",
     )
@@ -390,10 +469,92 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
     )
     p_esc.set_defaults(func=cmd_escalate)
 
+    # resume (unified smart continue / escalate / credit-failover / handoff)
+    p_res = sub.add_parser(
+        "resume",
+        aliases=["continue", "next"],
+        help="Smartly inspect and continue a session (auto-escalate blocked, failover exhausted credits, or hand off)",
+    )
+    p_res.add_argument(
+        "session_id",
+        nargs="?",
+        default=None,
+        help="Session ID to resume (defaults to current worktree's session, else latest session)",
+    )
+    p_res.add_argument(
+        "--from-session",
+        default=None,
+        metavar="SESSION_ID",
+        help="Explicit session ID to resume (alias for positional session_id)",
+    )
+    p_res.add_argument(
+        "-m",
+        "--note",
+        default="",
+        help="Optional extra guidance or handoff instructions",
+    )
+    p_res.add_argument(
+        "--tool",
+        choices=tools_choices,
+        default=None,
+        help="Override target tool when resuming/handing off",
+    )
+    p_res.add_argument("--model", default=None, help="Override target model (requires --tool)")
+    p_res.add_argument(
+        "--effort",
+        choices=list(VALID_EFFORTS),
+        default=None,
+        help="Override reasoning effort level when resuming",
+    )
+    p_res.add_argument(
+        "--mode",
+        choices=["interactive", "headless"],
+        default="interactive",
+        help="Execution mode (default: interactive)",
+    )
+    p_res.add_argument(
+        "--auto",
+        action="store_true",
+        help="Shortcut for `--mode headless --wait`",
+    )
+    p_res.add_argument(
+        "--wait",
+        action="store_true",
+        help="With --mode headless, run synchronously",
+    )
+    p_res.add_argument(
+        "--split",
+        action="store_true",
+        help="Launch in a split pane of the current tmux window",
+    )
+    p_res.add_argument(
+        "--auto-escalate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="With --wait/--auto, escalate a blocked agent and resume once (default: on)",
+    )
+    p_res.add_argument(
+        "--auto-failover",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically fail over to another service if credits are exhausted (default: on)",
+    )
+    p_res.add_argument(
+        "--agent-timeout",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help=(
+            "Timeout for synchronous agent runs (--wait/--auto, escalation) "
+            "(default: $AI_ROUTE_AGENT_TIMEOUT or 1800; <=0 disables)"
+        ),
+    )
+    p_res.set_defaults(func=cmd_resume)
+
     # status
     p_status = sub.add_parser(
         "status",
-        help="Show session status and detect blocked agents from captured output logs",
+        help="Show session status, credit cooldowns, and detect blocked agents from logs",
     )
     p_status.add_argument(
         "--from-session",
@@ -407,6 +568,20 @@ def build_parser(config: AppConfig | None = None) -> argparse.ArgumentParser:
         type=int,
         default=10,
         help="Number of recent sessions shown when no session is selected (default: 10)",
+    )
+    p_status.add_argument(
+        "--reset-credits",
+        nargs="?",
+        const="__all__",
+        default=None,
+        metavar="TOOL",
+        help="Clear credit-exhausted cooldown for a tool (or all tools if omitted)",
+    )
+    p_status.add_argument(
+        "--mark-exhausted",
+        default=None,
+        metavar="TOOL",
+        help="Manually mark a tool/service as credit-exhausted so routing skips it",
     )
     p_status.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     p_status.set_defaults(func=cmd_status)
@@ -635,7 +810,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         _fail(str(e))
 
     parser = build_parser(cfg)
-    args = parser.parse_args(raw_argv)
+    args = parser.parse_args(normalize_argv(raw_argv))
     try:
         args.func(args)
     except AiRouteError as e:

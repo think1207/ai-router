@@ -393,6 +393,8 @@ def _implement_from_review(
         stage="implementer",
         win_name=f"fix-{group_id[:6]}",
         pane_title=f"fix:{impl_tool}:{impl_model[:14]}",
+        effort=str(plan.get("implementer_effort") or ""),
+        difficulty=plan["implementer_difficulty"],
     )
 
 
