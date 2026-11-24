@@ -456,3 +456,7 @@ uv sync
 # Run unit tests
 uv run python -m unittest discover -s tests -v
 ```
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
